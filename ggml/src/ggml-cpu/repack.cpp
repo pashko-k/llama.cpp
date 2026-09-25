@@ -888,45 +888,48 @@ void ggml_gemv_q2_0_8x8_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, 
     const int qk_w = QK2_0;   // 64, weight block
     const int qk_a = QK8_0;   // 32, activation block
     const int nb_w = n / qk_w;
+    const int nb_a = n / qk_a;
 
     assert (n % qk_w == 0);
     assert (n % qk_a == 0);
     assert (nc % 8 == 0);
 
-    UNUSED(bs);
-    UNUSED(nr);
-
     // weight block l (64 elems) spans two q8_0 activation blocks (2l, 2l+1)
-    const block_q8_0 *  a_ptr = (const block_q8_0 *) vy;
+    const block_q8_0 *   a_ptr_start = (const block_q8_0 *) vy;
     const block_q2_0x8 * b_ptr_start = (const block_q2_0x8 *) vx;
 
-    for (int x = 0; x < nc / 8; x++) {
-        const block_q2_0x8 * b_ptr = b_ptr_start + x * nb_w;
-        float sumf[8] = {0};
+    for (int y = 0; y < nr; y++) {
+        const block_q8_0 * a_ptr = a_ptr_start + y * nb_a;
+        float * s_row = s + y * bs;
 
-        for (int l = 0; l < nb_w; l++) {
-            const float    da0 = GGML_CPU_FP16_TO_FP32(a_ptr[2 * l].d);
-            const float    da1 = GGML_CPU_FP16_TO_FP32(a_ptr[2 * l + 1].d);
-            const int8_t * a0  = a_ptr[2 * l].qs;
-            const int8_t * a1  = a_ptr[2 * l + 1].qs;
-            const uint8_t * bq = (const uint8_t *) b_ptr[l].qs;
+        for (int x = 0; x < nc / 8; x++) {
+            const block_q2_0x8 * b_ptr = b_ptr_start + x * nb_w;
+            float sumf[8] = {0};
 
-            for (int j = 0; j < 8; j++) {
-                const float dw = GGML_CPU_FP16_TO_FP32(b_ptr[l].d[j]);
-                float acc = 0.0f;
-                for (int e = 0; e < qk_w; e++) {
-                    const int byte_index = e / 4;
-                    const int bit        = (e % 4) * 2;
-                    const int qs_pos     = byte_index < 8 ? (j * 8 + byte_index) : (64 + j * 8 + (byte_index - 8));
-                    const int code       = (bq[qs_pos] >> bit) & 0x3;
-                    const int a = e < qk_a ? a0[e] : a1[e - qk_a];
-                    acc += (float) (code - 1) * (float) a * (e < qk_a ? da0 : da1);
+            for (int l = 0; l < nb_w; l++) {
+                const float    da0 = ggml_fp16_to_fp32(a_ptr[2 * l].d);
+                const float    da1 = ggml_fp16_to_fp32(a_ptr[2 * l + 1].d);
+                const int8_t * a0  = a_ptr[2 * l].qs;
+                const int8_t * a1  = a_ptr[2 * l + 1].qs;
+                const uint8_t * bq = (const uint8_t *) b_ptr[l].qs;
+
+                for (int j = 0; j < 8; j++) {
+                    const float dw = ggml_fp16_to_fp32(b_ptr[l].d[j]);
+                    float acc = 0.0f;
+                    for (int e = 0; e < qk_w; e++) {
+                        const int byte_index = e / 4;
+                        const int bit        = (e % 4) * 2;
+                        const int qs_pos     = byte_index < 8 ? (j * 8 + byte_index) : (64 + j * 8 + (byte_index - 8));
+                        const int code       = (bq[qs_pos] >> bit) & 0x3;
+                        const int a = e < qk_a ? a0[e] : a1[e - qk_a];
+                        acc += (float) (code - 1) * (float) a * (e < qk_a ? da0 : da1);
+                    }
+                    sumf[j] += acc * dw;
                 }
-                sumf[j] += acc * dw;
             }
-        }
 
-        for (int j = 0; j < 8; j++) s[x * 8 + j] = sumf[j];
+            for (int j = 0; j < 8; j++) s_row[x * 8 + j] = sumf[j];
+        }
     }
 }
 
@@ -2021,10 +2024,10 @@ void ggml_gemm_q2_0_8x8_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, 
                 const uint8_t * bq      = (const uint8_t *) b.qs;
 
                 for (int m = 0; m < 4; m++) {
-                    const float da0 = GGML_CPU_FP16_TO_FP32(a0.d[m]);
-                    const float da1 = GGML_CPU_FP16_TO_FP32(a1.d[m]);
+                    const float da0 = ggml_fp16_to_fp32(a0.d[m]);
+                    const float da1 = ggml_fp16_to_fp32(a1.d[m]);
                     for (int j = 0; j < 8; j++) {
-                        const float dw = GGML_CPU_FP16_TO_FP32(b.d[j]);
+                        const float dw = ggml_fp16_to_fp32(b.d[j]);
                         float acc = 0.0f;
                         for (int e = 0; e < qk_w; e++) {
                             const int byte_index = e / 4;
