@@ -140,6 +140,14 @@ static inline __m512i mul_sum_i8_pairs_acc_int32x16(const __m512i acc, const __m
     const __m512i sy = _mm512_mask_sub_epi8(y, blt0, zero, y);
     return mul_sum_us8_pairs_acc_int32x16(acc, ax, sy);
 }
+
+// horizontal sum of the 8 int32 lanes of a 256 bit vector
+static inline int64_t hsum256_i32(const __m256i v) {
+    __m128i s = _mm_add_epi32(_mm256_castsi256_si128(v), _mm256_extracti128_si256(v, 1));
+    s = _mm_add_epi32(s, _mm_shuffle_epi32(s, 0x4E));
+    s = _mm_add_epi32(s, _mm_shuffle_epi32(s, 0x39));
+    return (int64_t) (int32_t) _mm_cvtsi128_si32(s);
+}
 #endif
 
 // add int16_t pairwise and return as 256 bit int vector, then add the accumulator
@@ -1461,6 +1469,92 @@ void ggml_gemv_q4_0_8x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const vo
     ggml_gemv_q4_0_8x8_q8_0_generic(n, s, bs, vx, vy, nr, nc);
 }
 
+#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VNNI__)
+void ggml_gemv_q2_0_8x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
+    const int nb_w = n / QK2_0;
+
+    UNUSED(bs);
+    UNUSED(nr);
+
+    const block_q2_0x8 * b_ptr_start = (const block_q2_0x8 *) vx;
+    const block_q8_0 *   a_ptr       = (const block_q8_0 *) vy;
+
+    // 2-bit code -> signed byte (code - 1): LUT[0]=-1, LUT[1]=0, LUT[2]=1, LUT[3]=2
+    const __m128i lut128 = _mm_set_epi8(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 1, 0, -1);
+    const __m128i m2b    = _mm_set1_epi8(0x03);
+    const __m128i low8   = _mm_set_epi64x(0, 0xFFFFFFFFFFFFFFFFLL);
+
+    for (int x = 0; x < nc / 8; x++) {
+        const block_q2_0x8 * b_ptr = b_ptr_start + x * nb_w;
+        float sumf[8] = {0};
+
+        for (int l = 0; l < nb_w; l++) {
+            const float da0 = GGML_CPU_FP16_TO_FP32(a_ptr[2 * l].d);
+            const float da1 = GGML_CPU_FP16_TO_FP32(a_ptr[2 * l + 1].d);
+            const int8_t * a0 = a_ptr[2 * l].qs;
+            const int8_t * a1 = a_ptr[2 * l + 1].qs;
+            const uint8_t * bq = (const uint8_t *) b_ptr[l].qs;
+
+            // strided activation, built once per block, shared by all 8 rows
+            // row order in wbuf is [code%4 * 8 + code/4], so act must be act[i] = a[4*(i%8) + i/8]
+            int8_t actbuf[64] = {0};
+            for (int i = 0; i < 32; i++) {
+                actbuf[i]      = a0[4 * (i % 8) + (i / 8)];
+                actbuf[32 + i] = a1[4 * (i % 8) + (i / 8)];
+            }
+            const __m512i actvec = _mm512_loadu_si512((const __m512i *) actbuf);
+
+            for (int j = 0; j < 8; j++) {
+                const float dw = GGML_CPU_FP16_TO_FP32(b_ptr[l].d[j]);
+
+                // half 0: elems 0..31, 8 bytes at bq[j*8 .. j*8+7]
+                uint64_t r0;
+                memcpy(&r0, &bq[j * 8], 8);
+                const __m128i v0 = _mm_set_epi64x(0, (long long) r0);
+                const __m128i p0 = _mm_and_si128(_mm_shuffle_epi8(lut128, _mm_and_si128(v0, m2b)), low8);
+                const __m128i p1 = _mm_and_si128(_mm_shuffle_epi8(lut128, _mm_and_si128(_mm_srli_epi16(v0, 2), m2b)), low8);
+                const __m128i p2 = _mm_and_si128(_mm_shuffle_epi8(lut128, _mm_and_si128(_mm_srli_epi16(v0, 4), m2b)), low8);
+                const __m128i p3 = _mm_and_si128(_mm_shuffle_epi8(lut128, _mm_and_si128(_mm_srli_epi16(v0, 6), m2b)), low8);
+
+                // half 1: elems 32..63, 8 bytes at bq[64 + j*8 .. 64 + j*8+7]
+                uint64_t r1;
+                memcpy(&r1, &bq[64 + j * 8], 8);
+                const __m128i v1 = _mm_set_epi64x(0, (long long) r1);
+                const __m128i q0 = _mm_and_si128(_mm_shuffle_epi8(lut128, _mm_and_si128(v1, m2b)), low8);
+                const __m128i q1 = _mm_and_si128(_mm_shuffle_epi8(lut128, _mm_and_si128(_mm_srli_epi16(v1, 2), m2b)), low8);
+                const __m128i q2 = _mm_and_si128(_mm_shuffle_epi8(lut128, _mm_and_si128(_mm_srli_epi16(v1, 4), m2b)), low8);
+                const __m128i q3 = _mm_and_si128(_mm_shuffle_epi8(lut128, _mm_and_si128(_mm_srli_epi16(v1, 6), m2b)), low8);
+
+                // stack [p0|p1|p2|p3|q0|q1|q2|q3] into a 512-bit weight vector
+                int8_t wbuf[64] = {0};
+                _mm_storel_epi64((__m128i *) &wbuf[0],  p0);
+                _mm_storel_epi64((__m128i *) &wbuf[8],  p1);
+                _mm_storel_epi64((__m128i *) &wbuf[16], p2);
+                _mm_storel_epi64((__m128i *) &wbuf[24], p3);
+                _mm_storel_epi64((__m128i *) &wbuf[32], q0);
+                _mm_storel_epi64((__m128i *) &wbuf[40], q1);
+                _mm_storel_epi64((__m128i *) &wbuf[48], q2);
+                _mm_storel_epi64((__m128i *) &wbuf[56], q3);
+                const __m512i wvec = _mm512_loadu_si512((const __m512i *) wbuf);
+
+                const __m512i iacc = mul_sum_i8_pairs_acc_int32x16(_mm512_setzero_si512(), wvec, actvec);
+                const int64_t dot0 = hsum256_i32(_mm512_castsi512_si256(iacc));
+                const int64_t dot1 = hsum256_i32(_mm512_extracti64x4_epi64(iacc, 1));
+                sumf[j] += (da0 * (float) dot0 + da1 * (float) dot1) * dw;
+            }
+        }
+
+        for (int j = 0; j < 8; j++) {
+            s[x * 8 + j] = sumf[j];
+        }
+    }
+}
+#else
+void ggml_gemv_q2_0_8x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
+    ggml_gemv_q2_0_8x8_q8_0_generic(n, s, bs, vx, vy, nr, nc);
+}
+#endif
+
 void ggml_gemv_q4_K_8x8_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
     const int qk = QK_K;
     const int nb = n / qk;
@@ -2037,6 +2131,10 @@ void ggml_gemm_q4_0_8x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const vo
 #endif // defined(__AVX2__) || defined(__AVX512F__)
 
     ggml_gemm_q4_0_8x8_q8_0_generic(n, s, bs, vx, vy, nr, nc);
+}
+
+void ggml_gemm_q2_0_8x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
+    ggml_gemm_q2_0_8x8_q8_0_generic(n, s, bs, vx, vy, nr, nc);
 }
 
 void ggml_gemm_q4_K_8x8_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
