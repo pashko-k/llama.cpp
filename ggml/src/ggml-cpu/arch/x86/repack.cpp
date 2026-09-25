@@ -1474,6 +1474,10 @@ void ggml_gemv_q2_0_8x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const vo
     const int nb_w = n / QK2_0;
     const int nb_a = n / QK8_0;
 
+    assert(n % QK2_0 == 0);
+    assert(n % QK8_0 == 0);
+    assert(nc % 8 == 0);
+
     const block_q2_0x8 * b_ptr_start = (const block_q2_0x8 *) vx;
     const block_q8_0 *   a_ptr_start = (const block_q8_0 *) vy;
 
@@ -1498,7 +1502,7 @@ void ggml_gemv_q2_0_8x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const vo
                 const uint8_t * bq = (const uint8_t *) b_ptr[l].qs;
 
                 // strided activation, built once per block, shared by all 8 rows
-                // row order in wbuf is [code%4 * 8 + code/4], so act must be act[i] = a[4*(i%8) + i/8]
+                // wbuf[i] holds K = 4*(i%8) + i/8, so act must follow the same permutation
                 int8_t actbuf[64] = {0};
                 for (int i = 0; i < 32; i++) {
                     actbuf[i]      = a0[4 * (i % 8) + (i / 8)];
@@ -2137,7 +2141,7 @@ void ggml_gemm_q4_0_8x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const vo
 }
 
 void ggml_gemm_q2_0_8x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy, int nr, int nc) {
-#if 0 && defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VNNI__)
+#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VNNI__)
     {
         const int qk_w = QK2_0; // 64
         const int qk_a = QK8_0; // 32
@@ -2183,25 +2187,22 @@ void ggml_gemm_q2_0_8x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const vo
                     const uint8_t * w0 = (const uint8_t *)(b_ptr_0[l].qs) + half * 64;
                     const uint8_t * w1 = (const uint8_t *)(b_ptr_1[l].qs) + half * 64;
 
-                    // scalar unpack 2-bit codes into q4_0 PSHUFBW output byte order
+                    // scalar unpack: [014589CD K0-7][2367ABEF K0-7][014589CD K8-15][2367ABEF K8-15]...
                     alignas(64) int8_t wbuf[512];
                     static const int row_0145[8] = {0, 1, 4, 5, 0, 1, 4, 5};
                     static const int row_2367[8] = {2, 3, 6, 7, 2, 3, 6, 7};
                     for (int o = 0; o < 4; o++) {
-                        for (int c = 0; c < 4; c++) {
-                            const uint8_t * wp = (c < 2) ? (w0 + row_0145[c] * 8) : (w1 + row_0145[c - 2] * 8);
-                            const int K = o * 8;
+                        const int K = o * 8;
+                        for (int c = 0; c < 8; c++) {
+                            const uint8_t * wp = (c < 4) ? (w0 + row_0145[c] * 8) : (w1 + row_0145[c - 4] * 8);
                             for (int k = 0; k < 8; k++) {
-                                wbuf[(o * 8 + c) * 8 + k] = (int8_t)(((wp[(K + k) / 4] >> ((K + k) % 4 * 2)) & 3) - 1);
+                                wbuf[o * 128 + c * 8 + k] = (int8_t)(((wp[(K + k) / 4] >> ((K + k) % 4 * 2)) & 3) - 1);
                             }
                         }
-                    }
-                    for (int o = 0; o < 4; o++) {
-                        for (int c = 0; c < 4; c++) {
-                            const uint8_t * wp = (c < 2) ? (w0 + row_2367[c] * 8) : (w1 + row_2367[c - 2] * 8);
-                            const int K = o * 8;
+                        for (int c = 0; c < 8; c++) {
+                            const uint8_t * wp = (c < 4) ? (w0 + row_2367[c] * 8) : (w1 + row_2367[c - 4] * 8);
                             for (int k = 0; k < 8; k++) {
-                                wbuf[256 + (o * 8 + c) * 8 + k] = (int8_t)(((wp[(K + k) / 4] >> ((K + k) % 4 * 2)) & 3) - 1);
+                                wbuf[o * 128 + 64 + c * 8 + k] = (int8_t)(((wp[(K + k) / 4] >> ((K + k) % 4 * 2)) & 3) - 1);
                             }
                         }
                     }
@@ -2336,20 +2337,17 @@ void ggml_gemm_q2_0_8x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const vo
                     static const int row_0145[8] = {0, 1, 4, 5, 0, 1, 4, 5};
                     static const int row_2367[8] = {2, 3, 6, 7, 2, 3, 6, 7};
                     for (int o = 0; o < 4; o++) {
-                        for (int c = 0; c < 4; c++) {
-                            const uint8_t * wp = (c < 2) ? (w0 + row_0145[c] * 8) : (w1 + row_0145[c - 2] * 8);
-                            const int K = o * 8;
+                        const int K = o * 8;
+                        for (int c = 0; c < 8; c++) {
+                            const uint8_t * wp = (c < 4) ? (w0 + row_0145[c] * 8) : (w1 + row_0145[c - 4] * 8);
                             for (int k = 0; k < 8; k++) {
-                                wbuf[(o * 8 + c) * 8 + k] = (int8_t)(((wp[(K + k) / 4] >> ((K + k) % 4 * 2)) & 3) - 1);
+                                wbuf[o * 128 + c * 8 + k] = (int8_t)(((wp[(K + k) / 4] >> ((K + k) % 4 * 2)) & 3) - 1);
                             }
                         }
-                    }
-                    for (int o = 0; o < 4; o++) {
-                        for (int c = 0; c < 4; c++) {
-                            const uint8_t * wp = (c < 2) ? (w0 + row_2367[c] * 8) : (w1 + row_2367[c - 2] * 8);
-                            const int K = o * 8;
+                        for (int c = 0; c < 8; c++) {
+                            const uint8_t * wp = (c < 4) ? (w0 + row_2367[c] * 8) : (w1 + row_2367[c - 4] * 8);
                             for (int k = 0; k < 8; k++) {
-                                wbuf[256 + (o * 8 + c) * 8 + k] = (int8_t)(((wp[(K + k) / 4] >> ((K + k) % 4 * 2)) & 3) - 1);
+                                wbuf[o * 128 + 64 + c * 8 + k] = (int8_t)(((wp[(K + k) / 4] >> ((K + k) % 4 * 2)) & 3) - 1);
                             }
                         }
                     }
@@ -2490,20 +2488,17 @@ void ggml_gemm_q2_0_8x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const vo
                     static const int row_0145[4] = {0, 1, 4, 5};
                     static const int row_2367[4] = {2, 3, 6, 7};
                     for (int o = 0; o < 4; o++) {
+                        const int K = o * 8;
                         for (int c = 0; c < 4; c++) {
                             const uint8_t * wp = w + row_0145[c] * 8;
-                            const int K = o * 8;
                             for (int k = 0; k < 8; k++) {
-                                wbuf[o * 32 + c * 8 + k] = (int8_t)(((wp[(K + k) / 4] >> ((K + k) % 4 * 2)) & 3) - 1);
+                                wbuf[o * 64 + c * 8 + k] = (int8_t)(((wp[(K + k) / 4] >> ((K + k) % 4 * 2)) & 3) - 1);
                             }
                         }
-                    }
-                    for (int o = 0; o < 4; o++) {
                         for (int c = 0; c < 4; c++) {
                             const uint8_t * wp = w + row_2367[c] * 8;
-                            const int K = o * 8;
                             for (int k = 0; k < 8; k++) {
-                                wbuf[128 + o * 32 + c * 8 + k] = (int8_t)(((wp[(K + k) / 4] >> ((K + k) % 4 * 2)) & 3) - 1);
+                                wbuf[o * 64 + 32 + c * 8 + k] = (int8_t)(((wp[(K + k) / 4] >> ((K + k) % 4 * 2)) & 3) - 1);
                             }
                         }
                     }
@@ -2626,20 +2621,17 @@ void ggml_gemm_q2_0_8x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const vo
                     static const int row_0145[4] = {0, 1, 4, 5};
                     static const int row_2367[4] = {2, 3, 6, 7};
                     for (int o = 0; o < 4; o++) {
+                        const int K = o * 8;
                         for (int c = 0; c < 4; c++) {
                             const uint8_t * wp = w + row_0145[c] * 8;
-                            const int K = o * 8;
                             for (int k = 0; k < 8; k++) {
-                                wbuf[o * 32 + c * 8 + k] = (int8_t)(((wp[(K + k) / 4] >> ((K + k) % 4 * 2)) & 3) - 1);
+                                wbuf[o * 64 + c * 8 + k] = (int8_t)(((wp[(K + k) / 4] >> ((K + k) % 4 * 2)) & 3) - 1);
                             }
                         }
-                    }
-                    for (int o = 0; o < 4; o++) {
                         for (int c = 0; c < 4; c++) {
                             const uint8_t * wp = w + row_2367[c] * 8;
-                            const int K = o * 8;
                             for (int k = 0; k < 8; k++) {
-                                wbuf[128 + o * 32 + c * 8 + k] = (int8_t)(((wp[(K + k) / 4] >> ((K + k) % 4 * 2)) & 3) - 1);
+                                wbuf[o * 64 + 32 + c * 8 + k] = (int8_t)(((wp[(K + k) / 4] >> ((K + k) % 4 * 2)) & 3) - 1);
                             }
                         }
                     }
