@@ -1087,23 +1087,8 @@ static buft_list_t make_cpu_buft_list(const std::vector<llama_device> & devices,
         }
     }
 
-    // add a host buffer type
-    // storing the tensors in a host buffer is useful when the processing of large batches
-    // is offloaded to a GPU device, since it reduces the time spent on data transfers
-    // generally, this will be done using the first device in the list
-    // a better approach would be to handle this on a weight-by-weight basis using the offload_op
-    // function of the device to determine if it would benefit from being stored in a host buffer
-    if (!no_host) {
-        for (const auto & dev : devices) {
-            ggml_backend_buffer_type_t buft = ggml_backend_dev_host_buffer_type(dev.dev);
-            if (buft) {
-                buft_list.emplace_back(dev.dev, buft);
-                break;
-            }
-        }
-    }
-
-    // add extra buffer types
+    // add extra buffer types (e.g. CPU_REPACK)
+    // must come before the host buffer so that eligible tensors get repacked in CPU memory
     if (use_extra_bufts) {
         auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
         if (cpu_dev == nullptr) {
@@ -1118,6 +1103,22 @@ static buft_list_t make_cpu_buft_list(const std::vector<llama_device> & devices,
             while (extra_bufts && *extra_bufts) {
                 buft_list.emplace_back(cpu_dev, *extra_bufts);
                 ++extra_bufts;
+            }
+        }
+    }
+
+    // add a host buffer type
+    // storing the tensors in a host buffer is useful when the processing of large batches
+    // is offloaded to a GPU device, since it reduces the time spent on data transfers
+    // generally, this will be done using the first device in the list
+    // a better approach would be to handle this on a weight-by-weight basis using the offload_op
+    // function of the device to determine if it would benefit from being stored in a host buffer
+    if (!no_host) {
+        for (const auto & dev : devices) {
+            ggml_backend_buffer_type_t buft = ggml_backend_dev_host_buffer_type(dev.dev);
+            if (buft) {
+                buft_list.emplace_back(dev.dev, buft);
+                break;
             }
         }
     }

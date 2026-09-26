@@ -5379,13 +5379,9 @@ class extra_buffer_type : ggml::cpu::extra_buffer_type {
             if (op->src[1]->buffer && !ggml_backend_buft_is_host(op->src[1]->buffer->buft)) {
                 return false;
             }
-            if (op->src[1]->type == GGML_TYPE_F32) {
+            if (op->src[1]->type == GGML_TYPE_F32 || op->src[1]->type == GGML_TYPE_Q8_0) {
                 return true;
             }
-            //if (op->src[1]->type == GGML_TYPE_Q8_0) {
-            //    return true;
-            //}
-            // may be possible if Q8_0 packed...
         } else if (op->op == GGML_OP_MUL_MAT_ID
                 && op->src[0]->buffer
                 && (ggml_n_dims(op->src[0]) == 3)
@@ -5395,12 +5391,9 @@ class extra_buffer_type : ggml::cpu::extra_buffer_type {
             if (op->src[1]->buffer && !ggml_backend_buft_is_host(op->src[1]->buffer->buft)) {
                 return false;
             }
-            if (op->src[1]->type == GGML_TYPE_F32) {
+            if (op->src[1]->type == GGML_TYPE_F32 || op->src[1]->type == GGML_TYPE_Q8_0) {
                 return true;
             }
-            //if (op->src[1]->type == GGML_TYPE_Q8_0) {
-            //    return true;
-            //}
         }
         return false;
     }

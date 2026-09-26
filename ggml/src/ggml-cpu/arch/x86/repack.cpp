@@ -1478,6 +1478,14 @@ void ggml_gemv_q2_0_8x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const vo
     assert(n % QK8_0 == 0);
     assert(nc % 8 == 0);
 
+    {
+        static bool printed = false;
+        if (!printed) {
+            printed = true;
+            fprintf(stderr, "repack: gemv_q2_0_8x8_q8_0 called (n=%d nr=%d nc=%d)\n", n, nr, nc);
+        }
+    }
+
     const block_q2_0x8 * b_ptr_start = (const block_q2_0x8 *) vx;
     const block_q8_0 *   a_ptr_start = (const block_q8_0 *) vy;
 
@@ -2187,23 +2195,81 @@ void ggml_gemm_q2_0_8x8_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const vo
                     const uint8_t * w0 = (const uint8_t *)(b_ptr_0[l].qs) + half * 64;
                     const uint8_t * w1 = (const uint8_t *)(b_ptr_1[l].qs) + half * 64;
 
-                    // scalar unpack: [014589CD K0-7][2367ABEF K0-7][014589CD K8-15][2367ABEF K8-15]...
+                    // SIMD unpack: 2-bit packed -> int8 in VNNI layout
+                    // wbuf: [K0: rows0145(64) rows2367(64)] [K1: ...] [K2: ...] [K3: ...]
                     alignas(64) int8_t wbuf[512];
-                    static const int row_0145[8] = {0, 1, 4, 5, 0, 1, 4, 5};
-                    static const int row_2367[8] = {2, 3, 6, 7, 2, 3, 6, 7};
-                    for (int o = 0; o < 4; o++) {
-                        const int K = o * 8;
-                        for (int c = 0; c < 8; c++) {
-                            const uint8_t * wp = (c < 4) ? (w0 + row_0145[c] * 8) : (w1 + row_0145[c - 4] * 8);
-                            for (int k = 0; k < 8; k++) {
-                                wbuf[o * 128 + c * 8 + k] = (int8_t)(((wp[(K + k) / 4] >> ((K + k) % 4 * 2)) & 3) - 1);
-                            }
-                        }
-                        for (int c = 0; c < 8; c++) {
-                            const uint8_t * wp = (c < 4) ? (w0 + row_2367[c] * 8) : (w1 + row_2367[c - 4] * 8);
-                            for (int k = 0; k < 8; k++) {
-                                wbuf[o * 128 + 64 + c * 8 + k] = (int8_t)(((wp[(K + k) / 4] >> ((K + k) % 4 * 2)) & 3) - 1);
-                            }
+                    {
+                        const __m512i mask3   = _mm512_set1_epi8(3);
+                        const __m512i mask_2b = _mm512_set1_epi64(0xFFFFULL);
+                        const __m512i ones    = _mm512_set1_epi8(1);
+
+                        const __m512i w0f = _mm512_loadu_si512(w0);
+                        const __m512i w1f = _mm512_loadu_si512(w1);
+
+                        // the 16 meaningful bytes are at positions 0,1, 8,9, 16,17, 24,25, 32,33, 40,41, 48,49, 56,57
+                        // (2 bytes per 64-bit lane, 8 lanes). interleave indices account for this layout.
+                        // step 1: 2-way interleave of s0,s1 (16 meaningful bytes each -> 32 contiguous bytes)
+                        // permutex2var(A, I, B): A in low 64 [0..63], B in high 64 [64..127]
+                        static const uint8_t idx_i01_data[64] = {
+                            0,64, 1,65, 8,72, 9,73, 16,80, 17,81, 24,88, 25,89,
+                            32,96, 33,97, 40,104, 41,105, 48,112, 49,113, 56,120, 57,121,
+                            0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,0,
+                            0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,0};
+                        static const __m512i idx_i01 = _mm512_loadu_si512(idx_i01_data);
+                        // step 2: 2-byte group interleave (i01/i23 have 4 bytes per row at positions 4r..4r+3)
+                        // row r: [i01[4r],i01[4r+1], i23[4r],i23[4r+1], i01[4r+2],i01[4r+3], i23[4r+2],i23[4r+3]]
+                        static const uint8_t idx_grp_data[64] = {
+                            0,1, 64,65, 2,3, 66,67,
+                            4,5, 68,69, 6,7, 70,71,
+                            8,9, 72,73, 10,11, 74,75,
+                            12,13, 76,77, 14,15, 78,79,
+                            16,17, 80,81, 18,19, 82,83,
+                            20,21, 84,85, 22,23, 86,87,
+                            24,25, 88,89, 26,27, 90,91,
+                            28,29, 92,93, 30,31, 94,95};
+                        static const __m512i idx_grp = _mm512_loadu_si512(idx_grp_data);
+
+                        // row selection: 0145 = rows {0,1,4,5} from w0 + rows {0,1,4,5} from w1
+                        // 2367 = rows {2,3,6,7} from w0 + rows {2,3,6,7} from w1
+                        // u0 = w0 unpacked (64 bytes, row r at [r*8..r*8+7])
+                        // u1 = w1 unpacked (64 bytes)
+                        static const uint8_t idx_0145_data[64] = {
+                            0,1,2,3, 4,5,6,7,   8,9,10,11, 12,13,14,15,
+                            32,33,34,35, 36,37,38,39, 40,41,42,43, 44,45,46,47,
+                            64,65,66,67, 68,69,70,71, 72,73,74,75, 76,77,78,79,
+                            96,97,98,99, 100,101,102,103, 104,105,106,107, 108,109,110,111};
+                        static const __m512i idx_0145 = _mm512_loadu_si512(idx_0145_data);
+                        static const uint8_t idx_2367_data[64] = {
+                            16,17,18,19, 20,21,22,23, 24,25,26,27, 28,29,30,31,
+                            48,49,50,51, 52,53,54,55, 56,57,58,59, 60,61,62,63,
+                            80,81,82,83, 84,85,86,87, 88,89,90,91, 92,93,94,95,
+                            112,113,114,115, 116,117,118,119, 120,121,122,123, 124,125,126,127};
+                        static const __m512i idx_2367 = _mm512_loadu_si512(idx_2367_data);
+
+                        // unpack one source (64 bytes) -> 64 int8 in natural row order
+                        auto unpack_src = [&](const __m512i p) -> __m512i {
+                            const __m512i s0 = _mm512_and_si512(p, mask3);
+                            const __m512i s1 = _mm512_and_si512(_mm512_srli_epi16(p, 2), mask3);
+                            const __m512i s2 = _mm512_and_si512(_mm512_srli_epi16(p, 4), mask3);
+                            const __m512i s3 = _mm512_and_si512(_mm512_srli_epi16(p, 6), mask3);
+                            const __m512i i01 = _mm512_permutex2var_epi8(s0, idx_i01, s1);
+                            const __m512i i23 = _mm512_permutex2var_epi8(s2, idx_i01, s3);
+                            __m512i full = _mm512_permutex2var_epi8(i01, idx_grp, i23);
+                            return _mm512_sub_epi8(full, ones);
+                        };
+
+                        for (int o = 0; o < 4; o++) {
+                            const __m512i p0 = _mm512_and_si512(_mm512_srli_epi64(w0f, o * 16), mask_2b);
+                            const __m512i p1 = _mm512_and_si512(_mm512_srli_epi64(w1f, o * 16), mask_2b);
+
+                            const __m512i u0 = unpack_src(p0);
+                            const __m512i u1 = unpack_src(p1);
+
+                            __m512i r0145 = _mm512_permutex2var_epi8(u0, idx_0145, u1);
+                            __m512i r2367 = _mm512_permutex2var_epi8(u0, idx_2367, u1);
+
+                            _mm512_storeu_si512((__m512i *)(wbuf + o * 128 + 0), r0145);
+                            _mm512_storeu_si512((__m512i *)(wbuf + o * 128 + 64), r2367);
                         }
                     }
 
