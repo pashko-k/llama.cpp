@@ -53,6 +53,8 @@ struct moe_cache_slot {
     int      next;
     bool     valid;     // contents complete, lookups may hit
     bool     queued;    // insert copy queued or in flight
+    int16_t  blk;
+    int16_t  eid;
 };
 
 struct moe_cache_pool {
@@ -120,6 +122,7 @@ struct moe_cache_device {
     long long pool_hits[MOE_CACHE_MAX_POOLS] = {}, pool_miss[MOE_CACHE_MAX_POOLS] = {};
     long long miss_compulsory = 0, miss_capacity = 0, miss_admission = 0;
     long long skip_throttle = 0, skip_budget = 0, skip_qfull = 0, skip_lrubusy = 0;
+    long long skip_freq = 0, skip_first_hit = 0;
     std::unordered_set<uint64_t> ever_seen, ever_inserted;
     // per-phase wall time (thread-0 serial cost), microseconds
     long long t_plan_us = 0, t_disp_us = 0, t_coll_us = 0, n_nodes = 0;
@@ -138,6 +141,14 @@ struct moe_cache_job {
     int        eid = -1;
 };
 
+struct moe_cache_freq_tracker {
+    uint8_t count[1024][512] = {};
+    int64_t decode_tokens    = 0;
+    int     decay_tokens     = 512;
+    int     min_admit_freq   = 2;
+    bool    enabled          = true;
+};
+
 struct moe_cache_global {
     bool   enabled  = false;
     int    n_dev    = 0;
@@ -149,12 +160,15 @@ struct moe_cache_global {
     int    throttle_mod     = 8; // at capacity admit 1-in-N misses (GGML_CUDA_MOE_CACHE_THROTTLE)
     int    queue_max        = 512;
     int    n_workers        = 4;
-    size_t min_expert_bytes = 1u << 20; // skip models whose experts are too small
-                                        // to amortize per-node dispatch (measured:
-                                        // 0.45MB experts lose, 3MB+ win big)
+    size_t min_expert_bytes = 256u << 10; // default 256 KB floor (accommodates 450-850 KB experts)
     int    max_batch        = 1; // decode batches up to this size use the cache
                                  // (GGML_CUDA_MOE_CACHE_MAX_BATCH; >1 for spec-verify/parallel)
     int    stats_every      = 0; // log every N collect() calls (0 = off)
+
+    moe_cache_freq_tracker freq;
+    int    decay_blk = -1;              // dynamically learned lowest engaged gate layer for token decay
+    bool   sequential_backfill = false; // GGML_CUDA_MOE_CACHE_SEQUENTIAL_BACKFILL
+    int    mtp_blk = 1024;              // GGML_CUDA_MOE_CACHE_MTP_BLK (skip blk >= N, default disabled)
 
     moe_cache_device dev[MOE_CACHE_MAX_DEV];
 
@@ -209,13 +223,13 @@ struct moe_cache_global {
     // preloaded as the backfill's FIRST pass on the next run with the same
     // model fingerprint — the cache starts warm with yesterday's hot experts.
     bool     hotset_enabled = true;      // GGML_CUDA_MOE_CACHE_HOTSET=0 to disable
-    uint64_t hot_pair[1024][4] = {};     // loaded prior (preferred backfill order)
-    uint64_t hot_down[1024][4] = {};
+    uint64_t hot_pair[1024][8] = {};     // loaded prior (preferred backfill order; 512 experts)
+    uint64_t hot_down[1024][8] = {};
     bool     hot_loaded = false;
     int64_t  hotset_last_save = 0;
     char     hotset_path[512] = {};
-    uint64_t resident_pair[1024][4] = {};   // 256 experts / 64 bits
-    uint64_t resident_down[1024][4] = {};
+    uint64_t resident_pair[1024][8] = {};   // 512 experts / 64 bits
+    uint64_t resident_down[1024][8] = {};
 
     bool fuse = true;                    // GGML_CUDA_MOE_CACHE_FUSE=0 to disable. Stale-entry
                                          // hazard (MOE_CACHE_READINESS.md B1) closed by
@@ -336,6 +350,7 @@ static void moe_cache_lru_push_back(moe_cache_pool & p, int idx) {
 static bool moe_cache_backfill_next(moe_cache_job & out) {
 restart:
     if (g.backfill.phase == 0 && !g.hot_loaded) {
+        if (!g.sequential_backfill) { g.backfill.done = true; return false; }
         g.backfill.phase = 1;   // no prior: straight to the sweep
     }
     for (; g.backfill.blk < 1024; g.backfill.blk++, g.backfill.eid = 0) {
@@ -352,7 +367,8 @@ restart:
             const int unit = g.backfill.eid++;
             const int eid  = unit >> 1;
             const bool want_pair = (unit & 1) == 0;
-            if (g.backfill.phase == 0 && eid < 256) {
+            if (g.backfill.phase == 0) {
+                if (eid >= 512) continue;
                 // hot-prior pass: only entries that were resident last session
                 const uint64_t * hb = want_pair ? g.hot_pair[blk] : g.hot_down[blk];
                 if (!((hb[eid >> 6] >> (eid & 63)) & 1)) continue;
@@ -371,7 +387,12 @@ restart:
             if (p.map.count(key)) continue;
 
             const int si = p.n_used++;
-            p.slots[si] = moe_cache_slot{key, -1, -1, false, true};
+            p.slots[si] = moe_cache_slot{key, -1, -1, false, true, (int16_t)blk, (int16_t)eid};
+            if (blk >= 0 && blk < 1024 && eid >= 0 && eid < 512) {
+                if (g.freq.count[blk][eid] < g.freq.min_admit_freq) {
+                    g.freq.count[blk][eid] = (uint8_t)g.freq.min_admit_freq;
+                }
+            }
             moe_cache_lru_push_back(p, si);
             p.map[key] = si;
             d.inserts++;
@@ -385,6 +406,10 @@ restart:
         }
     }
     if (g.backfill.phase == 0) {
+        if (!g.sequential_backfill) {
+            g.backfill.done = true;
+            return false;
+        }
         // hot prior exhausted: run the sequential sweep for the rest
         g.backfill.phase = 1;
         g.backfill.blk = 0;
@@ -402,7 +427,7 @@ static void moe_cache_hotset_save_tick(int wid) {
     const int64_t now = ggml_time_us();
     if (now - g.hotset_last_save < 90 * 1000000ll) return;
     g.hotset_last_save = now;
-    static uint64_t snap_pair[1024][4], snap_down[1024][4];
+    static uint64_t snap_pair[1024][8], snap_down[1024][8];
     {
         std::lock_guard<std::mutex> lk2(g.mu);
         memcpy(snap_pair, g.resident_pair, sizeof(snap_pair));
@@ -497,7 +522,7 @@ static void moe_cache_worker_main(int wid) {
             g.cv_idle.notify_all();
             moe_cache_slot & s = p.slots[job.slot_idx];
             if (s.queued && s.key == job.key) {
-                if (job.blk >= 0 && job.blk < 1024 && job.eid >= 0 && job.eid < 256) {
+                if (job.blk >= 0 && job.blk < 1024 && job.eid >= 0 && job.eid < 512) {
                     (job.src_gate ? g.resident_pair : g.resident_down)[job.blk][job.eid >> 6]
                         |= 1ull << (job.eid & 63);
                 }
@@ -609,7 +634,7 @@ static bool moe_cache_pool_alloc(int di, size_t expert_size, int wtype, size_t b
     p.n_used      = 0;
     p.map.clear();
     p.lru_head = p.lru_tail = -1;
-    p.slots.assign(ns, moe_cache_slot{0, -1, -1, false, false});
+    p.slots.assign(ns, moe_cache_slot{0, -1, -1, false, false, -1, -1});
     d.n_pools++;
     MOE_CACHE_LOG("[moe-cache] dev=%d pool[%d]: type=%d slot=%zu KB slots=%d total=%zu MB%s\n",
             di, d.n_pools - 1, wtype, expert_size >> 10, ns,
@@ -711,7 +736,7 @@ static int moe_cache_begin(const char * name, const void * host_base, size_t exp
     // experts with a different quantization type (Q4_K vs trunk IQ2_XXS).
     // Caching them would create a second pool that consumes the full budget
     // independently (avail is recalculated from free VRAM each time).
-    if (blk >= 43) { moe_cache_gate_dbg("blk_mtp", name, n_tokens, expert_size, wtype, n_expert); return -1; }
+    if (blk >= g.mtp_blk) { moe_cache_gate_dbg("blk_mtp", name, n_tokens, expert_size, wtype, n_expert); return -1; }
 
     int role = -1;
     if      (strstr(name, "_gate_exps")) role = 0;
@@ -785,10 +810,32 @@ static int moe_cache_begin(const char * name, const void * host_base, size_t exp
                         if (ok) {
                             g.hot_loaded = true;
                             long bits = 0;
-                            for (int b2 = 0; b2 < 1024; b2++)
-                                for (int w2 = 0; w2 < 4; w2++)
+                            for (int b2 = 0; b2 < 1024; b2++) {
+                                for (int w2 = 0; w2 < 8; w2++) {
                                     bits += __builtin_popcountll(g.hot_pair[b2][w2]);
-                            MOE_CACHE_LOG("[moe-cache] hot-set prior loaded: %ld pair entries — backfill starts warm\n", bits);
+                                    if (g.hot_pair[b2][w2]) {
+                                        for (int bit = 0; bit < 64; bit++) {
+                                            if ((g.hot_pair[b2][w2] >> bit) & 1) {
+                                                const int eid = (w2 << 6) | bit;
+                                                if (eid < 512 && g.freq.count[b2][eid] < g.freq.min_admit_freq) {
+                                                    g.freq.count[b2][eid] = (uint8_t)g.freq.min_admit_freq;
+                                                }
+                                            }
+                                        }
+                                    }
+                                    if (g.hot_down[b2][w2]) {
+                                        for (int bit = 0; bit < 64; bit++) {
+                                            if ((g.hot_down[b2][w2] >> bit) & 1) {
+                                                const int eid = (w2 << 6) | bit;
+                                                if (eid < 512 && g.freq.count[b2][eid] < g.freq.min_admit_freq) {
+                                                    g.freq.count[b2][eid] = (uint8_t)g.freq.min_admit_freq;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            MOE_CACHE_LOG("[moe-cache] hot-set prior loaded: %ld pair entries - backfill starts warm\n", bits);
                         }
                     }
                 }
@@ -969,10 +1016,35 @@ static int moe_cache_plan(int di, const int32_t * ids, int n_ids, int32_t * slot
 
     std::lock_guard<std::mutex> lk(g.mu);
 
+    // decay tick: runs under g.mu on the lowest engaged gate layer once per decode token
+    if (g.cur_n_tokens == 1 && g.cur_role == 0 && g.cur_blk >= 0) {
+        if (g.decay_blk < 0 || g.cur_blk < g.decay_blk) {
+            g.decay_blk = g.cur_blk;
+        }
+        if (g.cur_blk == g.decay_blk) {
+            g.freq.decode_tokens++;
+            if (g.freq.enabled && g.freq.decay_tokens > 0 && (g.freq.decode_tokens % g.freq.decay_tokens) == 0) {
+                uint64_t * p64 = (uint64_t *)g.freq.count;
+                const size_t n64 = sizeof(g.freq.count) / sizeof(uint64_t);
+                for (size_t i = 0; i < n64; i++) {
+                    p64[i] = (p64[i] >> 1) & 0x7F7F7F7F7F7F7F7FULL;
+                }
+            }
+        }
+    }
+
     for (int k = 0; k < n_ids; k++) {
         slot_idx[k] = -1;
         const int eid = ids[k];
         if (eid < 0 || eid >= g.cur_n_expert) continue;
+
+        // frequency tracking: count accesses on gate (role 0) and down (role 2) only
+        if ((g.cur_role == 0 || g.cur_role == 2) && g.cur_blk >= 0 && g.cur_blk < 1024 && eid < 512) {
+            if (g.freq.count[g.cur_blk][eid] < 255) {
+                g.freq.count[g.cur_blk][eid]++;
+            }
+        }
+
         const uint64_t key = moe_cache_key(g.cur_key_base, eid);
 
         auto it = p.map.find(key);
@@ -1005,7 +1077,42 @@ static int moe_cache_plan(int di, const int32_t * ids, int n_ids, int32_t * slot
             d.miss_admission++;  // seen before but never admitted
         }
 
-        // ---- enqueue async insert (budgeted) ----
+        // ---- admission evaluation: filter candidates before checking insert budget ----
+        const bool freq_active = g.freq.enabled && g.cur_role >= 0 && g.cur_blk >= 0 && g.cur_blk < 1024 && eid < 512 && g.cur_n_expert <= 512;
+        if (freq_active) {
+            const int f_in = g.freq.count[g.cur_blk][eid];
+            if (p.n_used < p.n_slots) {
+                if (f_in < g.freq.min_admit_freq) {
+                    d.insert_skips++;
+                    d.skip_first_hit++;
+                    continue;
+                }
+            } else {
+                int cand = p.lru_head;
+                int guard = 0;
+                while (cand >= 0 && p.slots[cand].queued && guard++ < 64) cand = p.slots[cand].next;
+                if (cand < 0 || p.slots[cand].queued) { d.insert_skips++; d.skip_lrubusy++; continue; }
+                const moe_cache_slot & vslot = p.slots[cand];
+                int f_victim = 0;
+                if (vslot.blk >= 0 && vslot.blk < 1024 && vslot.eid >= 0 && vslot.eid < 512) {
+                    f_victim = g.freq.count[vslot.blk][vslot.eid];
+                }
+                if (f_in <= f_victim) {
+                    d.insert_skips++;
+                    d.skip_freq++;
+                    continue;
+                }
+            }
+        } else {
+            // legacy throttle at capacity
+            if (p.n_used >= p.n_slots && (d.misses % g.throttle_mod) != 0) {
+                d.insert_skips++;
+                d.skip_throttle++;
+                continue;
+            }
+        }
+
+        // candidate earned admission: check queue and insert budget
         if (inserts_left <= 0) {
             d.insert_skips++;
             d.skip_budget++;
@@ -1016,16 +1123,8 @@ static int moe_cache_plan(int di, const int32_t * ids, int n_ids, int32_t * slot
             d.skip_qfull++;
             continue;
         }
-        // admission throttle at capacity: when the pool is full, churn (evict +
-        // re-copy on every miss) steals host RAM bandwidth from the CPU matmuls.
-        // Admit only a fraction of misses so the content still adapts but the
-        // copy traffic stays bounded.
-        if (p.n_used >= p.n_slots && (d.misses % g.throttle_mod) != 0) {
-            d.insert_skips++;
-            d.skip_throttle++;
-            continue;
-        }
-        // paired-entry inserts (gate/up roles only — pools can be SHARED with
+
+        // paired-entry inserts (gate/up roles only - pools can be SHARED with
         // other roles whose tensors merely have the same shape; those use the
         // plain name-keyed path below and never collide in key space)
         const bool pair_entry = p.paired && (g.cur_role == 0 || g.cur_role == 1);
@@ -1048,10 +1147,10 @@ static int moe_cache_plan(int di, const int32_t * ids, int n_ids, int32_t * slot
             if (old.valid || old.queued) {
                 p.map.erase(old.key);
                 d.evictions++;
-                // residency bitmap (hot-set persistence): this expert is leaving.
-                // The key does not encode (blk,eid) reversibly, so clear lazily:
-                // a stale bit merely makes the next session's warm backfill load
-                // one expert that is no longer hot (harmless).
+                if (old.blk >= 0 && old.blk < 1024 && old.eid >= 0 && old.eid < 512) {
+                    (p.paired ? g.resident_pair : g.resident_down)[old.blk][old.eid >> 6]
+                        &= ~(1ull << (old.eid & 63));
+                }
             }
             moe_cache_lru_remove(p, si);
         }
@@ -1065,7 +1164,7 @@ static int moe_cache_plan(int di, const int32_t * ids, int n_ids, int32_t * slot
             src_up = (const char *)g.cur_host_base + (size_t)eid * g.cur_expert_size;
         }
 
-        p.slots[si] = moe_cache_slot{key, -1, -1, false, true};
+        p.slots[si] = moe_cache_slot{key, -1, -1, false, true, (int16_t)g.cur_blk, (int16_t)eid};
         moe_cache_lru_push_back(p, si);
         p.map[key] = si;
         d.inserts++;
@@ -1627,10 +1726,10 @@ static void moe_cache_stats(void) {
                 i, d.hits, tot, tot ? 100.0 * d.hits / tot : 0.0,
                 d.inserts, d.evictions, d.insert_skips, d.queued_misses,
                 used, slots, g.queue.size());
-        MOE_CACHE_LOG("[moe-cache] dev=%d decomp: compulsory=%lld capacity=%lld admission=%lld inflight=%lld uniq-seen=%zu uniq-inserted=%zu | skips: throttle=%lld budget=%lld qfull=%lld lru=%lld\n",
+        MOE_CACHE_LOG("[moe-cache] dev=%d decomp: compulsory=%lld capacity=%lld admission=%lld inflight=%lld uniq-seen=%zu uniq-inserted=%zu | skips: freq=%lld first_hit=%lld throttle=%lld budget=%lld qfull=%lld lru=%lld\n",
                 i, d.miss_compulsory, d.miss_capacity, d.miss_admission, d.queued_misses,
                 d.ever_seen.size(), d.ever_inserted.size(),
-                d.skip_throttle, d.skip_budget, d.skip_qfull, d.skip_lrubusy);
+                d.skip_freq, d.skip_first_hit, d.skip_throttle, d.skip_budget, d.skip_qfull, d.skip_lrubusy);
         for (int pi = 0; pi < d.n_pools; pi++) {
             const long long ptot = d.pool_hits[pi] + d.pool_miss[pi];
             MOE_CACHE_LOG("[moe-cache] dev=%d pool[%d]: hits=%lld/%lld (%.1f%%) slots=%d slot=%zuKB\n",
@@ -1791,8 +1890,13 @@ void ggml_moe_cache_register(void) {
     if (const char * e = getenv("GGML_CUDA_MOE_CACHE_REUSE"))         g.reuse = atoi(e) > 0;
     if (const char * e = getenv("GGML_CUDA_MOE_CACHE_FUSE"))          g.fuse = atoi(e) > 0;
     if (const char * e = getenv("GGML_CUDA_MOE_CACHE_MAX_BATCH"))     { int n = atoi(e); if (n >= 1 && n <= 8) g.max_batch = n; }
-    if (const char * e = getenv("GGML_CUDA_MOE_CACHE_PREFETCH"))      g.backfill.enabled = atoi(e) > 0;
-    if (const char * e = getenv("GGML_CUDA_MOE_CACHE_HOTSET"))        g.hotset_enabled = atoi(e) > 0;
+    if (const char * e = getenv("GGML_CUDA_MOE_CACHE_PREFETCH"))            g.backfill.enabled = atoi(e) > 0;
+    if (const char * e = getenv("GGML_CUDA_MOE_CACHE_HOTSET"))              g.hotset_enabled = atoi(e) > 0;
+    if (const char * e = getenv("GGML_CUDA_MOE_CACHE_FREQ_FILTER"))         g.freq.enabled = atoi(e) > 0;
+    if (const char * e = getenv("GGML_CUDA_MOE_CACHE_MIN_FREQ"))            { int n = atoi(e); if (n >= 1) g.freq.min_admit_freq = n; }
+    if (const char * e = getenv("GGML_CUDA_MOE_CACHE_DECAY_TOKENS"))        { int n = atoi(e); if (n >= 1) g.freq.decay_tokens = n; }
+    if (const char * e = getenv("GGML_CUDA_MOE_CACHE_SEQUENTIAL_BACKFILL")) g.sequential_backfill = atoi(e) > 0;
+    if (const char * e = getenv("GGML_CUDA_MOE_CACHE_MTP_BLK"))             { int n = atoi(e); if (n >= 0) g.mtp_blk = n; }
     g.hotset_last_save = ggml_time_us();   // first save no sooner than one period in
     memset(g.blk_pair_pool, -1, sizeof(g.blk_pair_pool));
     memset(g.blk_down_pool, -1, sizeof(g.blk_down_pool));
