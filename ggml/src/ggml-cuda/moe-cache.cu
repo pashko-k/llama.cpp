@@ -63,6 +63,7 @@ struct moe_cache_pool {
     char * slab        = nullptr;   // up weights (mmv x operand)
     char * slab2       = nullptr;   // gate weights (fusion operand), paired pools only
     bool   paired      = false;     // one entry covers the (gate, up) pair of an expert
+    bool   is_down     = false;     // role == 2 (down projection) pool
     int    n_slots     = 0;
     int    n_used      = 0;
 
@@ -563,7 +564,7 @@ static void moe_cache_start_workers() {
 // simply gets its pool late. No visit order can lock a device out.
 struct moe_cache_discovery {
     std::unordered_set<uint64_t> seen;
-    struct shape { size_t size; int wtype; int n_tensors; int roles; int64_t n_expert; };
+    struct shape { size_t size; int wtype; int n_tensors; int roles; int64_t n_expert; bool is_down; };
     std::vector<shape> pending[MOE_CACHE_MAX_DEV];   // shapes seen, pool not yet built
     bool any_repeat = false;
     // stable-census guard: pools are built only after the shape census has not
@@ -571,12 +572,18 @@ struct moe_cache_discovery {
     // partially-discovered census mis-sizes pools permanently (measured: the
     // 754B server lost its down pools to visit-order luck).
     int  stable_count = 0;
+    // full-pass gate: the visit-count window alone can build pools before late
+    // blocks register their tensors (mixed-quant models order shapes by layer,
+    // so a partial census biases n_tensors toward the early blocks). Pools
+    // build only after a device's lowest engaged blk is reached a second time.
+    int  min_blk[MOE_CACHE_MAX_DEV];        // lowest engaged blk seen (sentinel set in register)
+    bool wrap[MOE_CACHE_MAX_DEV] = {};      // one full model pass completed on this device
 };
 static moe_cache_discovery g_disc;
 
 // build one pool for (size, wtype) on device di; caller ensures no duplicate
 static bool moe_cache_pool_alloc(int di, size_t expert_size, int wtype, size_t budget, bool paired,
-                           int64_t max_entries) {
+                           int64_t max_entries, bool is_down) {
     moe_cache_device & d = g.dev[di];
     if (d.n_pools >= MOE_CACHE_MAX_POOLS) return false;
 
@@ -600,6 +607,7 @@ static bool moe_cache_pool_alloc(int di, size_t expert_size, int wtype, size_t b
         moe_cache_pool & p = d.pools[d.n_pools];
         p.expert_size = expert_size;
         p.wtype       = wtype;
+        p.is_down     = is_down;
         p.slab        = nullptr;
         p.n_slots     = 0;
         d.n_pools++;
@@ -630,6 +638,7 @@ static bool moe_cache_pool_alloc(int di, size_t expert_size, int wtype, size_t b
     p.slab        = slab;
     p.slab2       = slab2;
     p.paired      = paired;
+    p.is_down     = is_down;
     p.n_slots     = ns;
     p.n_used      = 0;
     p.map.clear();
@@ -638,7 +647,7 @@ static bool moe_cache_pool_alloc(int di, size_t expert_size, int wtype, size_t b
     d.n_pools++;
     MOE_CACHE_LOG("[moe-cache] dev=%d pool[%d]: type=%d slot=%zu KB slots=%d total=%zu MB%s\n",
             di, d.n_pools - 1, wtype, expert_size >> 10, ns,
-            ((size_t)(paired ? 2 : 1) * ns * expert_size) >> 20, paired ? " (paired)" : "");
+            ((size_t)(paired ? 2 : 1) * ns * expert_size) >> 20, paired ? " (paired)" : (is_down ? " (down)" : ""));
 
     if (!d.compute_stream) {
         CUDA_CHECK(cudaStreamCreateWithFlags(&d.compute_stream, cudaStreamNonBlocking));
@@ -743,6 +752,8 @@ static int moe_cache_begin(const char * name, const void * host_base, size_t exp
     else if (strstr(name, "_up_exps"))   role = 1;
     else if (strstr(name, "_down_exps")) role = 2;
 
+    const bool is_down = (role == 2);
+
     const int di = blk % g.n_dev;
 
     const uint64_t kb = moe_cache_fnv1a(name);
@@ -753,24 +764,32 @@ static int moe_cache_begin(const char * name, const void * host_base, size_t exp
     // shape discovery + on-demand pool construction (see moe_cache_discovery)
     int pi = -1;
     for (int i = 0; i < d.n_pools; i++) {
-        if (d.pools[i].expert_size == expert_size && d.pools[i].wtype == wtype) { pi = i; break; }
+        if (d.pools[i].expert_size == expert_size && d.pools[i].wtype == wtype && d.pools[i].is_down == is_down) {
+            pi = i;
+            break;
+        }
     }
     if (pi < 0) {
         moe_cache_discovery::shape * shp = nullptr;
         for (auto & sh : g_disc.pending[di]) {
-            if (sh.size == expert_size && sh.wtype == wtype) { shp = &sh; break; }
+            if (sh.size == expert_size && sh.wtype == wtype && sh.is_down == is_down) {
+                shp = &sh;
+                break;
+            }
         }
         if (!shp) {
-            g_disc.pending[di].push_back({expert_size, wtype, 0, 0, n_expert});
+            g_disc.pending[di].push_back({expert_size, wtype, 0, 0, n_expert, is_down});
             shp = &g_disc.pending[di].back();
             g_disc.stable_count = 0;   // census changed: restart the stability window
-            MOE_CACHE_DBG("[moe-cache-dbg] new shape %s blk=%d dev=%d size=%zu type=%d\n",
-                    name, blk, di, expert_size, wtype);
+            MOE_CACHE_DBG("[moe-cache-dbg] new shape %s blk=%d dev=%d size=%zu type=%d down=%d\n",
+                    name, blk, di, expert_size, wtype, (int)is_down);
         } else {
             g_disc.stable_count++;
         }
         if (first_sight) shp->n_tensors++;   // distinct tensors using this shape
         if (role >= 0) shp->roles |= 1 << role;
+        if (blk < g_disc.min_blk[di]) { g_disc.min_blk[di] = blk; g_disc.wrap[di] = false; }   // new lower block: pass incomplete
+        else if (!first_sight && blk == g_disc.min_blk[di]) { g_disc.wrap[di] = true; }        // reached the bottom again: pass done
         if (!g_disc.any_repeat) {
             if (g_disc.seen.count(kb)) {
                 g_disc.any_repeat = true;
@@ -784,7 +803,9 @@ static int moe_cache_begin(const char * name, const void * host_base, size_t exp
         if (g_gate_dbg_cap > 0 && g_gate_dbg_n++ < g_gate_dbg_cap)
             MOE_CACHE_LOG("[moe-cache-dbg] census stable=%d/64 repeat=%d nt=%lld name=%.40s\n",
                     (int)g_disc.stable_count, (int)g_disc.any_repeat, (long long)n_tokens, name ? name : "?");
-        if (g_disc.stable_count < 64) {
+        if (g_disc.stable_count < 64 || !g_disc.wrap[di]) {
+            // full-pass gate: never build on a partial census, coverage beats
+            // visit count - late-block shapes must register before sizing
             return -1;
         }
         static bool announced = false;
@@ -859,6 +880,10 @@ static int moe_cache_begin(const char * name, const void * host_base, size_t exp
             }
             MOE_CACHE_LOG("[moe-cache-dbg] budget dev=%d free=%zu MB total=%zu MB reserve=%zu MB avail=%zu MB shapes=%d\n",
                     di, free_mem >> 20, total_mem >> 20, reserve >> 20, avail >> 20, (int)pend.size());
+            for (const auto & sh : pend) {
+                MOE_CACHE_LOG("[moe-cache-dbg] census dev=%d: size=%zu KB type=%d tensors=%d roles=%d down=%d n_expert=%lld\n",
+                        di, sh.size >> 10, sh.wtype, sh.n_tensors, sh.roles, (int)sh.is_down, (long long)sh.n_expert);
+            }
             // Role-group budgeting. Mixed-quant models (UD-*_XL) fragment one
             // role into many (size, type) shapes; naive per-shape weighting
             // hands each fragment a sliver below the slot floor and the whole
@@ -870,7 +895,7 @@ static int moe_cache_begin(const char * name, const void * host_base, size_t exp
                 return (double)sh.size * (sh.n_tensors > 0 ? sh.n_tensors : 1);
             };
             auto is_paired_sh = [&](const moe_cache_discovery::shape & sh) {
-                return g.fuse && (sh.roles & 0b11) == 0b11;
+                return g.fuse && !sh.is_down && (sh.roles & 0b11) == 0b11;
             };
             double w_pair = 0.0, w_rest = 0.0;
             for (auto & sh : pend) {
@@ -898,7 +923,7 @@ static int moe_cache_begin(const char * name, const void * host_base, size_t exp
                 const size_t need = (size_t)max_entries * sh.size * (paired ? 2 : 1);
                 if (budget > need) budget = need;          // never strand bytes in caps
                 const size_t before = budget;
-                if (moe_cache_pool_alloc(di, sh.size, sh.wtype, budget, paired, max_entries)) {
+                if (moe_cache_pool_alloc(di, sh.size, sh.wtype, budget, paired, max_entries, sh.is_down)) {
                     group_left[gidx] -= before;            // consumed (approx; slack folds forward)
                 }
                 // dead fragments consume nothing: their share flows to the
@@ -908,7 +933,10 @@ static int moe_cache_begin(const char * name, const void * host_base, size_t exp
         }
         pend.clear();
         for (int i = 0; i < d.n_pools; i++) {
-            if (d.pools[i].expert_size == expert_size && d.pools[i].wtype == wtype) { pi = i; break; }
+            if (d.pools[i].expert_size == expert_size && d.pools[i].wtype == wtype && d.pools[i].is_down == is_down) {
+                pi = i;
+                break;
+            }
         }
         if (pi < 0) { moe_cache_gate_dbg("no_pool_after_build", name, n_tokens, expert_size, wtype, n_expert); return -1; }
     }
@@ -1898,6 +1926,7 @@ void ggml_moe_cache_register(void) {
     if (const char * e = getenv("GGML_CUDA_MOE_CACHE_SEQUENTIAL_BACKFILL")) g.sequential_backfill = atoi(e) > 0;
     if (const char * e = getenv("GGML_CUDA_MOE_CACHE_MTP_BLK"))             { int n = atoi(e); if (n >= 0) g.mtp_blk = n; }
     g.hotset_last_save = ggml_time_us();   // first save no sooner than one period in
+    for (int i = 0; i < MOE_CACHE_MAX_DEV; i++) { g_disc.min_blk[i] = 1 << 30; }
     memset(g.blk_pair_pool, -1, sizeof(g.blk_pair_pool));
     memset(g.blk_down_pool, -1, sizeof(g.blk_down_pool));
 
