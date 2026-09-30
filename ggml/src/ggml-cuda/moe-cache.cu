@@ -1116,7 +1116,7 @@ static int moe_cache_begin(const char * name, const void * host_base, size_t exp
         return -1;
     }
 
-    if (g.tail_seed_pending && g.tail_seed_enabled) {
+    if (g.tail_seed_pending && g.tail_seed_enabled && g.bail.eligible_seen >= moe_cache_global::BAIL_WARM) {
         std::lock_guard<std::mutex> lk(g.mu);
         if (moe_cache_enqueue_tail_seed()) {
             g.tail_seed_pending = false;
@@ -1859,12 +1859,15 @@ static void moe_cache_invalidate(const void * base, size_t size) {
         }
         return true;
     });
+    bool wiped_any = false;
     for (int b = 0; b < 1024; b++) {
-        if (in_range(g.role_base[0][b])) g.role_base[0][b] = nullptr;
-        if (in_range(g.role_base[1][b])) g.role_base[1][b] = nullptr;
+        if (in_range(g.role_base[0][b])) { g.role_base[0][b] = nullptr; wiped_any = true; }
+        if (in_range(g.role_base[1][b])) { g.role_base[1][b] = nullptr; wiped_any = true; }
     }
-    g.tail_seed_pending = false;
-    memset(g.tail_seed, 0, sizeof(g.tail_seed));
+    if (wiped_any) {
+        g.tail_seed_pending = false;
+        memset(g.tail_seed, 0, sizeof(g.tail_seed));
+    }
 }
 
 // ---- API: node wall-time samples (bail-out) ---------------------------------------------
