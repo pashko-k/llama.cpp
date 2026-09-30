@@ -86,6 +86,9 @@ struct ggml_moe_cache_api {
     // Node wall-time sample for the bail-out judge. code is begin()'s return
     // value: -3 = pure-CPU baseline sample, >= 0 = cache-engaged sample.
     void (*node_time)(int code, int64_t wall_us);
+
+    // Prompt tail seeding: record active expert during prefill tail tokens
+    void (*tail_seed_record)(const char * name, int eid, int64_t n_tokens);
 };
 
 // Zero-initialized in ggml-backend.cpp; populated by the CUDA backend in

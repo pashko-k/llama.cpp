@@ -171,6 +171,12 @@ struct moe_cache_global {
     bool   sequential_backfill = false; // GGML_CUDA_MOE_CACHE_SEQUENTIAL_BACKFILL
     int    mtp_blk = 1024;              // GGML_CUDA_MOE_CACHE_MTP_BLK (skip blk >= N, default disabled)
 
+    // prompt tail seeding (GGML_CUDA_MOE_CACHE_TAIL_SEED)
+    bool      tail_seed_enabled = true;
+    bool      tail_seed_pending = false;
+    uint64_t  tail_seed[1024][8] = {};
+    long long tail_seed_enqueued = 0;
+
     moe_cache_device dev[MOE_CACHE_MAX_DEV];
 
     // prefetch backfill cursor (guarded by mu): walks (blk, eid) space and
@@ -684,6 +690,132 @@ static void moe_cache_gate_dbg_enter(const char * name, int64_t n_tokens,
     }
 }
 
+// ---- prompt tail seeding --------------------------------------------------------
+
+static void moe_cache_tail_seed_record(const char * name, int eid, int64_t n_tokens) {
+    // only prefill passes record tail seeds (n_tokens > max_batch); skips decode warmup
+    if (!g.enabled || g.bail.tripped || !g.tail_seed_enabled || n_tokens <= g.max_batch || !name) return;
+    const char * p = strstr(name, "blk.");
+    if (!p || !strstr(name, "_exps")) return;
+    const int blk = atoi(p + 4);
+    if (blk < 0 || blk >= 1024 || eid < 0 || eid >= 512) return;
+    g.tail_seed[blk][eid >> 6] |= (1ull << (eid & 63));
+    g.tail_seed_pending = true;
+}
+
+// enqueue async preload jobs from prompt tail seeding (g.mu held).
+// pushes jobs to front of g.queue, prioritizing lower layers.
+static bool moe_cache_enqueue_tail_seed(void) {
+    bool any_pools = false;
+    for (int i = 0; i < g.n_dev; i++) {
+        if (g.dev[i].n_pools > 0) { any_pools = true; break; }
+    }
+    if (!any_pools) return false;
+
+    std::vector<moe_cache_job> jobs;
+    jobs.reserve(256);
+
+    for (int blk = 0; blk < 1024; blk++) {
+        if (blk >= g.mtp_blk) continue;
+
+        bool any_bits = false;
+        for (int w = 0; w < 8; w++) {
+            if (g.tail_seed[blk][w] != 0) { any_bits = true; break; }
+        }
+        if (!any_bits) continue;
+
+        const int di = blk % g.n_dev;
+        moe_cache_device & d = g.dev[di];
+        if (d.dead || d.n_pools == 0) continue;
+
+        for (int pass = 0; pass < 2; pass++) {
+            const bool want_pair = (pass == 0);
+            const int pi = want_pair ? g.blk_pair_pool[blk] : g.blk_down_pool[blk];
+            if (pi < 0 || pi >= d.n_pools) continue;
+
+            moe_cache_pool & p = d.pools[pi];
+            if (!p.slab) continue;
+            if (want_pair && (!p.paired || !g.role_base[0][blk] || !g.role_base[1][blk])) continue;
+            if (!want_pair && !g.blk_down_base[blk]) continue;
+
+            for (int w = 0; w < 8; w++) {
+                uint64_t mask = g.tail_seed[blk][w];
+                while (mask) {
+                    const int bit = __builtin_ctzll(mask);
+                    mask &= mask - 1;
+                    const int eid = (w << 6) | bit;
+
+                    if (g.blk_n_expert[blk] > 0 && eid >= g.blk_n_expert[blk]) continue;
+                    if ((int)g.queue.size() + (int)jobs.size() >= g.queue_max) break;
+
+                    const uint64_t key = want_pair
+                        ? moe_cache_key(MOE_CACHE_PAIR_KEY_TAG ^ ((uint64_t)blk << 32) ^ moe_cache_ptr_hash(g.role_base[0][blk]), eid)
+                        : moe_cache_key(g.blk_down_kb[blk], eid);
+                    if (p.map.count(key)) continue;
+
+                    int si = -1;
+                    if (p.n_used < p.n_slots) {
+                        si = p.n_used++;
+                    } else {
+                        int cand = p.lru_head;
+                        int guard = 0;
+                        while (cand >= 0 && p.slots[cand].queued && guard++ < 64) cand = p.slots[cand].next;
+                        if (cand < 0 || p.slots[cand].queued) continue;
+                        const moe_cache_slot & vslot = p.slots[cand];
+                        if (g.freq.enabled) {
+                            int f_victim = 0;
+                            if (vslot.blk >= 0 && vslot.blk < 1024 && vslot.eid >= 0 && vslot.eid < 512) {
+                                f_victim = g.freq.count[vslot.blk][vslot.eid];
+                            }
+                            if (f_victim > g.freq.min_admit_freq) continue;
+                        }
+                        si = cand;
+                        moe_cache_slot & old = p.slots[si];
+                        if (old.valid || old.queued) {
+                            p.map.erase(old.key);
+                            d.evictions++;
+                            if (old.blk >= 0 && old.blk < 1024 && old.eid >= 0 && old.eid < 512) {
+                                (p.paired ? g.resident_pair : g.resident_down)[old.blk][old.eid >> 6]
+                                    &= ~(1ull << (old.eid & 63));
+                            }
+                        }
+                        moe_cache_lru_remove(p, si);
+                    }
+
+                    p.slots[si] = moe_cache_slot{key, -1, -1, false, true, (int16_t)blk, (int16_t)eid};
+                    moe_cache_lru_push_back(p, si);
+                    p.map[key] = si;
+                    d.inserts++;
+                    d.ever_inserted.insert(key);
+
+                    if (eid >= 0 && eid < 512 && g.freq.count[blk][eid] < g.freq.min_admit_freq) {
+                        g.freq.count[blk][eid] = (uint8_t)g.freq.min_admit_freq;
+                    }
+
+                    const void * src_up = want_pair
+                        ? (const char *)g.role_base[1][blk] + (size_t)eid * p.expert_size
+                        : (const char *)g.blk_down_base[blk] + (size_t)eid * p.expert_size;
+                    const void * src_gate = want_pair
+                        ? (const char *)g.role_base[0][blk] + (size_t)eid * p.expert_size
+                        : nullptr;
+
+                    jobs.push_back(moe_cache_job{di, pi, key, si, src_up, src_gate, p.expert_size, blk, eid});
+                }
+            }
+        }
+    }
+
+    if (!jobs.empty()) {
+        for (int i = (int)jobs.size() - 1; i >= 0; i--) {
+            g.queue.push_front(jobs[i]);
+        }
+        g.tail_seed_enqueued += jobs.size();
+        g.cv.notify_all();
+        MOE_CACHE_LOG("[moe-cache] tail-seed: enqueued %zu jobs for async preload\n", jobs.size());
+    }
+    return true;
+}
+
 // ---- API: begin -----------------------------------------------------------------
 
 static int moe_cache_begin(const char * name, const void * host_base, size_t expert_size,
@@ -982,6 +1114,14 @@ static int moe_cache_begin(const char * name, const void * host_base, size_t exp
         // them in parallel with the prompt; the decode path stays untouched
         moe_cache_gate_dbg("prefill", name, n_tokens, expert_size, wtype, n_expert);
         return -1;
+    }
+
+    if (g.tail_seed_pending && g.tail_seed_enabled) {
+        std::lock_guard<std::mutex> lk(g.mu);
+        if (moe_cache_enqueue_tail_seed()) {
+            g.tail_seed_pending = false;
+            memset(g.tail_seed, 0, sizeof(g.tail_seed));
+        }
     }
 
     // bail-out phases (decode visits on a working pool only)
@@ -1723,6 +1863,8 @@ static void moe_cache_invalidate(const void * base, size_t size) {
         if (in_range(g.role_base[0][b])) g.role_base[0][b] = nullptr;
         if (in_range(g.role_base[1][b])) g.role_base[1][b] = nullptr;
     }
+    g.tail_seed_pending = false;
+    memset(g.tail_seed, 0, sizeof(g.tail_seed));
 }
 
 // ---- API: node wall-time samples (bail-out) ---------------------------------------------
@@ -1788,6 +1930,8 @@ static void moe_cache_stats(void) {
             MOE_CACHE_LOG("[moe-cache] dev=%d redirect: claims=%lld miss-rows-up=%lld fused-layers=%lld\n",
                     i, d.redirect_claims, d.redirect_misses_up, d.fused_layers);
             if (i == 0) {
+                MOE_CACHE_LOG("[moe-cache] tail-seed: preloaded=%lld enabled=%d pending=%d\n",
+                        g.tail_seed_enqueued, (int)g.tail_seed_enabled, (int)g.tail_seed_pending);
                 MOE_CACHE_LOG("[moe-cache] bail-ewma: base=%.1fus(n=%lld) on=%.1fus(n=%lld)\n",
                         g.bail.base_ewma, g.bail.base_n, g.bail.on_ewma, g.bail.on_n);
             }
@@ -1935,6 +2079,7 @@ void ggml_moe_cache_register(void) {
     if (const char * e = getenv("GGML_CUDA_MOE_CACHE_MAX_BATCH"))     { int n = atoi(e); if (n >= 1 && n <= 8) g.max_batch = n; }
     if (const char * e = getenv("GGML_CUDA_MOE_CACHE_PREFETCH"))            g.backfill.enabled = atoi(e) > 0;
     if (const char * e = getenv("GGML_CUDA_MOE_CACHE_HOTSET"))              g.hotset_enabled = atoi(e) > 0;
+    if (const char * e = getenv("GGML_CUDA_MOE_CACHE_TAIL_SEED"))           g.tail_seed_enabled = atoi(e) > 0;
     if (const char * e = getenv("GGML_CUDA_MOE_CACHE_FREQ_FILTER"))         g.freq.enabled = atoi(e) > 0;
     if (const char * e = getenv("GGML_CUDA_MOE_CACHE_MIN_FREQ"))            { int n = atoi(e); if (n >= 1) g.freq.min_admit_freq = n; }
     if (const char * e = getenv("GGML_CUDA_MOE_CACHE_DECAY_TOKENS"))        { int n = atoi(e); if (n >= 1) g.freq.decay_tokens = n; }
@@ -1955,6 +2100,7 @@ void ggml_moe_cache_register(void) {
     ggml_moe_cache.glu_hits          = moe_cache_glu_hits;
     ggml_moe_cache.invalidate        = moe_cache_invalidate;
     ggml_moe_cache.node_time         = moe_cache_node_time;
+    ggml_moe_cache.tail_seed_record  = moe_cache_tail_seed_record;
     if (const char * e = getenv("GGML_CUDA_MOE_CACHE_REDIRECT")) g.redirect_on = atoi(e) > 0;
 
     MOE_CACHE_LOG("[moe-cache] enabled: n_dev=%d budget=%s inserts/plan=%d workers=%d stats_every=%d\n",

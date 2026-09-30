@@ -1708,6 +1708,10 @@ static void ggml_compute_forward_mul_mat_id(
 
                 assert(i02 >= 0 && i02 < n_as);
 
+                if (ggml_moe_cache.tail_seed_record && moe_cache_dev < 0 && iid1 == ids->ne[1] - 1) {
+                    ggml_moe_cache.tail_seed_record(src0->name, i02, ids->ne[1]);
+                }
+
                 if (moe_cache_dev >= 0 && moe_cache_slot_idx[iid1*n_ids + id] >= 0) {
                     // GPU computes this row from the expert cache
                     const int64_t i11 = id % ne11;
