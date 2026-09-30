@@ -890,6 +890,9 @@ private:
     int trace = 0;        // env: LLAMA_TRACE
     int slots_debug = 0;  // env: LLAMA_SERVER_SLOTS_DEBUG
     int slots_n_diff = 0; // env: LLAMA_SERVER_SLOTS_N_DIFF
+    int defer_count = 0;
+    int max_defer   = 0;  // env: LLAMA_SERVER_MOE_CACHE_MAX_DEFER (0 = disabled)
+    int cache_max_batch = 8; // env: GGML_CUDA_MOE_CACHE_MAX_BATCH
 
     int n_empty_consecutive = 0;
 
@@ -1337,6 +1340,20 @@ private:
 
             if (slots_n_diff) {
                 SRV_WRN("LLAMA_SERVER_SLOTS_N_DIFF = %d\n", slots_n_diff);
+            }
+        }
+
+        {
+            const char * LLAMA_SERVER_MOE_CACHE_MAX_DEFER = getenv("LLAMA_SERVER_MOE_CACHE_MAX_DEFER");
+            if (LLAMA_SERVER_MOE_CACHE_MAX_DEFER) {
+                max_defer = atoi(LLAMA_SERVER_MOE_CACHE_MAX_DEFER);
+            }
+            const char * GGML_CUDA_MOE_CACHE_MAX_BATCH = getenv("GGML_CUDA_MOE_CACHE_MAX_BATCH");
+            if (GGML_CUDA_MOE_CACHE_MAX_BATCH) {
+                const int n = atoi(GGML_CUDA_MOE_CACHE_MAX_BATCH);
+                if (n >= 1 && n <= 8) {
+                    cache_max_batch = n;
+                }
             }
         }
 
@@ -3104,6 +3121,27 @@ private:
 
         auto & alora_scale       = batch.alora_scale;
         auto & alora_disabled_id = batch.alora_disabled_id;
+
+        // bounded deferral: keep batch decode-only for up to max_defer consecutive ticks
+        if (max_defer > 0 && params_base.cont_batching && batch.size() > 0 && batch.size() <= cache_max_batch) {
+            bool has_pending_prompt = false;
+            for (const auto & slot : slots) {
+                if (slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_STARTED) {
+                    has_pending_prompt = true;
+                    break;
+                }
+            }
+
+            if (has_pending_prompt) {
+                if (defer_count < max_defer) {
+                    defer_count++;
+                    return;
+                }
+                defer_count = 0;
+            } else {
+                defer_count = 0;
+            }
+        }
 
         // next, batch any pending prompts without exceeding n_batch
         if (params_base.cont_batching || batch.size() == 0) {

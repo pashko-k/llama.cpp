@@ -1588,7 +1588,6 @@ static void ggml_compute_forward_mul_mat_id(
     const int n_as  = ne02;       // n_expert
 
     // MoE expert cache state (set on thread 0 only; other threads keep dev = -1)
-    enum { MOE_CACHE_MAX_TOPK = 64 };
     int           moe_cache_dev = -1;
     int64_t       moe_cache_t0 = 0;
     int           moe_cache_n_hits = 0;

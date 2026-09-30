@@ -162,7 +162,7 @@ struct moe_cache_global {
     int    queue_max        = 512;
     int    n_workers        = 4;
     size_t min_expert_bytes = 256u << 10; // default 256 KB floor (accommodates 450-850 KB experts)
-    int    max_batch        = 1; // decode batches up to this size use the cache
+    int    max_batch        = 8; // decode batches up to this size use the cache
                                  // (GGML_CUDA_MOE_CACHE_MAX_BATCH; >1 for spec-verify/parallel)
     int    stats_every      = 0; // log every N collect() calls (0 = off)
 
@@ -202,7 +202,7 @@ struct moe_cache_global {
     int          cur_blk  = -1;
     int          cur_role = -1;   // 0=gate 1=up 2=down -1=other
     int64_t      cur_n_tokens = 1;
-    int32_t      cur_slot_idx[64] = {};
+    int32_t      cur_slot_idx[MOE_CACHE_MAX_TOPK] = {};
     int          cur_n_ids = 0;
     std::unordered_map<const void *, int> glu_learn;  // gate MMID dst base -> blk
     bool         reuse    = true; // GGML_CUDA_MOE_CACHE_REUSE=0 to disable act-quant reuse
@@ -1023,17 +1023,17 @@ static int moe_cache_plan(int di, const int32_t * ids, int n_ids, int32_t * slot
     // rows are computed already (fused dispatch at the gate node); a fresh
     // lookup could diverge (eviction between the plans) and skip a row that
     // nobody computed.
-    if (g.cur_n_tokens == 1 && p.paired && g.cur_role == 1 &&
+    if (g.cur_n_tokens == 1 && n_ids <= 64 && p.paired && g.cur_role == 1 &&
         g.cur_blk >= 0 && g.cur_blk < 1024 && g.safe_fuse_blk[g.cur_blk] &&
         d.fused.active && d.fused.gate_dst != nullptr) {
         int nh = 0;
-        for (int k = 0; k < n_ids && k < 64; k++) {
+        for (int k = 0; k < n_ids; k++) {
             const bool hit = (d.fused.mask >> k) & 1ull;
             slot_idx[k] = hit ? 0 : -1;   // value unused (no dispatch); sign is the skip signal
             if (hit) nh++;
         }
         g.cur_n_ids = n_ids;
-        for (int k = 0; k < n_ids && k < 64; k++) g.cur_slot_idx[k] = slot_idx[k];
+        for (int k = 0; k < n_ids && k < MOE_CACHE_MAX_TOPK; k++) g.cur_slot_idx[k] = slot_idx[k];
         d.t_plan_us += ggml_time_us() - t0;
         d.n_nodes++;
         return nh;
@@ -1045,13 +1045,15 @@ static int moe_cache_plan(int di, const int32_t * ids, int n_ids, int32_t * slot
     std::lock_guard<std::mutex> lk(g.mu);
 
     // decay tick: runs under g.mu on the lowest engaged gate layer once per decode token
-    if (g.cur_n_tokens == 1 && g.cur_role == 0 && g.cur_blk >= 0) {
+    if (g.cur_n_tokens <= g.max_batch && g.cur_role == 0 && g.cur_blk >= 0) {
         if (g.decay_blk < 0 || g.cur_blk < g.decay_blk) {
             g.decay_blk = g.cur_blk;
         }
         if (g.cur_blk == g.decay_blk) {
-            g.freq.decode_tokens++;
-            if (g.freq.enabled && g.freq.decay_tokens > 0 && (g.freq.decode_tokens % g.freq.decay_tokens) == 0) {
+            const int64_t prev_tok = g.freq.decode_tokens;
+            g.freq.decode_tokens += g.cur_n_tokens;
+            if (g.freq.enabled && g.freq.decay_tokens > 0 &&
+                (prev_tok / g.freq.decay_tokens) != (g.freq.decode_tokens / g.freq.decay_tokens)) {
                 uint64_t * p64 = (uint64_t *)g.freq.count;
                 const size_t n64 = sizeof(g.freq.count) / sizeof(uint64_t);
                 for (size_t i = 0; i < n64; i++) {
@@ -1066,6 +1068,19 @@ static int moe_cache_plan(int di, const int32_t * ids, int n_ids, int32_t * slot
         const int eid = ids[k];
         if (eid < 0 || eid >= g.cur_n_expert) continue;
 
+        int prev_k = -1;
+        for (int j = 0; j < k; j++) {
+            if (ids[j] == eid) {
+                prev_k = j;
+                break;
+            }
+        }
+        if (prev_k >= 0) {
+            slot_idx[k] = slot_idx[prev_k];
+            if (slot_idx[k] >= 0) n_hits++;
+            continue;
+        }
+
         // frequency tracking: count accesses on gate (role 0) and down (role 2) only
         if ((g.cur_role == 0 || g.cur_role == 2) && g.cur_blk >= 0 && g.cur_blk < 1024 && eid < 512) {
             if (g.freq.count[g.cur_blk][eid] < 255) {
@@ -1075,9 +1090,9 @@ static int moe_cache_plan(int di, const int32_t * ids, int n_ids, int32_t * slot
 
         const uint64_t key = moe_cache_key(g.cur_key_base, eid);
 
-        auto it = p.map.find(key);
-        if (it != p.map.end()) {
-            const int si = it->second;
+        auto it_p = p.map.find(key);
+        if (it_p != p.map.end()) {
+            const int si = it_p->second;
             moe_cache_slot & s = p.slots[si];
             if (s.valid) {
                 moe_cache_lru_remove(p, si);
@@ -1211,7 +1226,7 @@ static int moe_cache_plan(int di, const int32_t * ids, int n_ids, int32_t * slot
 
     // stash the per-position result so collect can reconstruct dst row indices
     g.cur_n_ids = n_ids;
-    for (int k = 0; k < n_ids && k < 64; k++) g.cur_slot_idx[k] = slot_idx[k];
+    for (int k = 0; k < n_ids && k < MOE_CACHE_MAX_TOPK; k++) g.cur_slot_idx[k] = slot_idx[k];
 
     d.t_plan_us += ggml_time_us() - t0;
     d.n_nodes++;

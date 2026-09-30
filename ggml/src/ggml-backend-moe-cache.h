@@ -17,6 +17,8 @@
 extern "C" {
 #endif
 
+#define MOE_CACHE_MAX_TOPK 256
+
 struct ggml_moe_cache_api {
     // Decide whether the cache engages for this MUL_MAT_ID node.
     // Returns the device id to use (>= 0) or -1 to stay on the pure-CPU path.
