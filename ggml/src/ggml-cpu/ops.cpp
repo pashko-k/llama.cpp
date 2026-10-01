@@ -1,5 +1,5 @@
 #include "ops.h"
-#include "../ggml-backend-moe-cache.h"
+#include "ggml-backend-moe-cache.h"
 
 #include "ggml-cpu.h"
 #include "ggml-impl.h"

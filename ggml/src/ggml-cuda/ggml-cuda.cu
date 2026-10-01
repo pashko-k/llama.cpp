@@ -504,6 +504,11 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
                     err = ggml_cuda_device_malloc(&ptr, look_ahead_size, device);
                 }
             }
+            if (err == cudaErrorMemoryAllocation && look_ahead_size > size) {
+                (void)cudaGetLastError();
+                look_ahead_size = size;
+                err = ggml_cuda_device_malloc(&ptr, look_ahead_size, device);
+            }
             if (err == cudaSuccess) {
                 GGML_LOG_DEBUG(GGML_CUDA_NAME " pool[%d]: retry succeeded\n", device);
             }

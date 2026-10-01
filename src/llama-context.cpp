@@ -1,6 +1,7 @@
 #include "llama-context.h"
 
 #include "ggml.h"
+#include "ggml-backend-moe-cache.h"
 #include "llama-arch.h"
 #include "llama-graph.h"
 #include "llama-impl.h"
@@ -691,15 +692,22 @@ void llama_context::sched_reserve() {
         n_input_tensors_pp = this->n_input_tensors;
     }
 
-    // reserve with tg (token generation) graph to get the number of splits and nodes
+    // reserve with tg (token generation) graph to get the number of splits, nodes, and decode memory footprint
+    std::vector<size_t> tg_graph_sizes(backend_ptrs.size(), 0);
     if (cparams.training) {
         // no tg graph for training
         n_splits_tg = n_splits_pp;
         n_nodes_tg  = n_nodes_pp;
     } else {
-        auto * gf = graph_reserve(n_seqs, n_seqs, n_seqs, mctx.get(), model.hparams.no_alloc);
+        const uint32_t n_tokens_tg  = std::min(n_tokens, std::max(n_seqs * 4, (uint32_t) 8));
+        const uint32_t n_outputs_tg = std::max((uint32_t) 1, std::min(n_tokens_tg, cparams.n_outputs_max));
+        auto * gf = graph_reserve(n_tokens_tg, n_seqs, n_outputs_tg, mctx.get(), model.hparams.no_alloc);
         if (!gf) {
             throw std::runtime_error("failed to allocate compute tg buffers");
+        }
+
+        for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+            tg_graph_sizes[i] = ggml_backend_sched_get_graph_size(sched.get(), backend_ptrs[i]);
         }
 
         n_splits_tg        = ggml_backend_sched_get_n_splits(sched.get());
@@ -709,26 +717,29 @@ void llama_context::sched_reserve() {
     }
 
     // reserve again with pp graph to avoid ggml-alloc reallocations during inference
+    ggml_cgraph * gf_pp = nullptr;
     {
         // TODO: the worst case graph is not always reached for `n_seqs > 1`
         //       need to implement a more robust mechanism that tries a few different inputs and analyzes the results
-        ggml_cgraph * gf = nullptr;
         switch (model.arch) {
             case LLM_ARCH_KIMI_LINEAR:
             case LLM_ARCH_MINIMAX_01:
                 // [TAG_RESERVE_DIAG_DECAY]
                 // the `inp_diag_decay` tensor size scales with `n_seq_tokens^2` which
                 // makes `n_seqs == 1` use more memory for the compute graph compared to `n_seqs > 1`
-                gf = graph_reserve(n_tokens, 1,      n_outputs_pp, mctx.get(), model.hparams.no_alloc);
+                gf_pp = graph_reserve(n_tokens, 1,      n_outputs_pp, mctx.get(), model.hparams.no_alloc);
                 break;
             default:
-                gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(), model.hparams.no_alloc);
+                gf_pp = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(), model.hparams.no_alloc);
         };
 
-        if (!gf) {
+        if (!gf_pp) {
             throw std::runtime_error("failed to allocate compute pp buffers");
         }
     }
+
+    moe_cache_tg_reserves.assign(backend_ptrs.size(), 0);
+    moe_cache_tg_bases.assign(backend_ptrs.size(), nullptr);
 
     for (size_t i = 0; i < backend_ptrs.size(); ++i) {
         ggml_backend_t             backend = backend_ptrs[i];
@@ -740,6 +751,31 @@ void llama_context::sched_reserve() {
             LLAMA_LOG_INFO("%s: %10s compute buffer size = %8.2f MiB\n", __func__,
                     ggml_backend_buft_name(buft),
                     backend_buf_exp_size[i] / 1024.0 / 1024.0);
+        }
+
+        // MoE cache: alias the idle tail of the monolithic compute buffer during decode
+        if (ggml_moe_cache.set_vram_slab && !ggml_backend_buft_is_host(buft)) {
+            ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+            if (dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+                ggml_gallocr_t galloc = ggml_backend_sched_get_gallocr(sched.get());
+                if (galloc) {
+                    ggml_backend_buffer_t chunk0 = ggml_gallocr_get_buffer_chunk(galloc, (int) i, 0);
+                    if (chunk0 && !ggml_gallocr_get_buffer_chunk(galloc, (int) i, 1)) {
+                        const size_t bsize = ggml_backend_buffer_get_size(chunk0);
+                        const size_t tg_need = tg_graph_sizes[i];
+                        const size_t tg_reserve = std::max((size_t)(64 * 1024 * 1024),
+                                (size_t)GGML_PAD(tg_need * 2, 2 * 1024 * 1024));
+                        if (bsize > tg_reserve) {
+                            const size_t slab_size = bsize - tg_reserve;
+                            void * base = ggml_backend_buffer_get_base(chunk0);
+                            void * slab_base = (char *) base + tg_reserve;
+                            moe_cache_tg_reserves[i] = tg_reserve;
+                            moe_cache_tg_bases[i]    = base;
+                            ggml_moe_cache.set_vram_slab(slab_base, slab_size);
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -1443,6 +1479,34 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             ret = GGML_STATUS_ALLOC_FAILED;
             return nullptr;
+        }
+
+        // MoE cache invariant checks
+        for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+            if (i < moe_cache_tg_reserves.size() && moe_cache_tg_reserves[i] > 0) {
+                if (ubatch.n_tokens <= 8) {
+                    const size_t cur_size = ggml_backend_sched_get_graph_size(sched.get(), backend_ptrs[i]);
+                    GGML_ASSERT(cur_size <= moe_cache_tg_reserves[i] && "MoE cache slab overrun: decode graph exceeded tg_reserve");
+                }
+
+                // check if the compute buffer base moved due to reallocation
+                ggml_gallocr_t galloc = ggml_backend_sched_get_gallocr(sched.get());
+                if (galloc && ggml_moe_cache.set_vram_slab) {
+                    ggml_backend_buffer_t chunk0 = ggml_gallocr_get_buffer_chunk(galloc, (int) i, 0);
+                    if (chunk0) {
+                        void * cur_base = ggml_backend_buffer_get_base(chunk0);
+                        if (cur_base != moe_cache_tg_bases[i]) {
+                            const size_t bsize = ggml_backend_buffer_get_size(chunk0);
+                            if (bsize > moe_cache_tg_reserves[i]) {
+                                const size_t slab_size = bsize - moe_cache_tg_reserves[i];
+                                void * slab_base = (char *) cur_base + moe_cache_tg_reserves[i];
+                                moe_cache_tg_bases[i] = cur_base;
+                                ggml_moe_cache.set_vram_slab(slab_base, slab_size);
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         gf_res_prev_active = res;

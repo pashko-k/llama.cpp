@@ -72,6 +72,10 @@ GGML_API bool ggml_gallocr_reserve_n(
 GGML_API bool ggml_gallocr_alloc_graph(ggml_gallocr_t galloc, struct ggml_cgraph * graph);
 
 GGML_API size_t ggml_gallocr_get_buffer_size(ggml_gallocr_t galloc, int buffer_id);
+GGML_API ggml_backend_buffer_t ggml_gallocr_get_buffer_chunk(ggml_gallocr_t galloc, int buffer_id, int chunk_id);
+
+// returns the memory required by graph tensors in the buffer chunk (without any extra margin)
+GGML_API size_t ggml_gallocr_get_graph_size(ggml_gallocr_t galloc, int buffer_id);
 
 // Utils
 // Create a buffer and allocate all the tensors in a ggml_context

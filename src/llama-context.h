@@ -375,6 +375,10 @@ private:
     std::vector<ggml_backend_buffer_type_t> backend_buft;
     std::vector<size_t>                     backend_buf_exp_size; // expected buffer sizes
 
+    // MoE cache: tg reservation bounds and buffer bases for slab invariant enforcement
+    std::vector<size_t> moe_cache_tg_reserves;
+    std::vector<void *> moe_cache_tg_bases;
+
     // Separate arenas give batches with and without outputs distinct CUDA graph cache keys.
     std::array<llm_graph_result_ptr, 2> gf_res_prev;
     llm_graph_result_ptr gf_res_reserve;

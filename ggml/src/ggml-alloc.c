@@ -1115,6 +1115,24 @@ size_t ggml_gallocr_get_buffer_size(ggml_gallocr_t galloc, int buffer_id) {
     return ggml_vbuffer_size(galloc->buffers[buffer_id]);
 }
 
+ggml_backend_buffer_t ggml_gallocr_get_buffer_chunk(ggml_gallocr_t galloc, int buffer_id, int chunk_id) {
+    GGML_ASSERT(buffer_id >= 0 && buffer_id < galloc->n_buffers);
+    GGML_ASSERT(chunk_id >= 0 && chunk_id < GGML_VBUFFER_MAX_CHUNKS);
+    if (galloc->buffers[buffer_id] == NULL) {
+        return NULL;
+    }
+    return galloc->buffers[buffer_id]->chunks[chunk_id];
+}
+
+size_t ggml_gallocr_get_graph_size(ggml_gallocr_t galloc, int buffer_id) {
+    GGML_ASSERT(galloc != NULL);
+    GGML_ASSERT(buffer_id >= 0 && buffer_id < galloc->n_buffers);
+    if (!galloc->buf_tallocs[buffer_id]) {
+        return 0;
+    }
+    return ggml_dyn_tallocr_max_size(galloc->buf_tallocs[buffer_id], 0);
+}
+
 // utils
 
 static void free_buffers(ggml_backend_buffer_t ** buffers, const size_t * n_buffers) {

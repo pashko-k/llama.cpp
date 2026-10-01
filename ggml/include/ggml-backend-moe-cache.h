@@ -30,7 +30,7 @@ struct ggml_moe_cache_api {
     //   n_in/n_out:  src0->ne[0] / src0->ne[1]
     //   wtype:       src0->type
     //   n_expert:    src0->ne[2]
-    //   n_tokens:    ids->ne[1] (cache engages only when == 1)
+    //   n_tokens:    ids->ne[1] (cache engages when <= max_batch, e.g. 1..8 for MTP/parallel)
     int (*begin)(const char * tensor_name, const void * host_base, size_t expert_size,
                  int64_t n_in, int64_t n_out, int wtype, int64_t n_expert, int64_t n_tokens);
 
@@ -89,6 +89,11 @@ struct ggml_moe_cache_api {
 
     // Prompt tail seeding: record active expert during prefill tail tokens
     void (*tail_seed_record)(const char * name, int eid, int64_t n_tokens);
+
+    // Notify the cache of the slab carved from the tail of the compute buffer.
+    // base is a device pointer inside the compute buffer; size == 0 clears it.
+    // A change of base/size invalidates all entries backed by the old slab.
+    void (*set_vram_slab)(void * base, size_t size);
 };
 
 // Zero-initialized in ggml-backend.cpp; populated by the CUDA backend in

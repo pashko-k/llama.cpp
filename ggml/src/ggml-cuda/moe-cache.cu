@@ -24,7 +24,7 @@
 #include "mmvq.cuh"
 #include "quantize.cuh"
 #include "ggml-backend-impl.h"
-#include "../ggml-backend-moe-cache.h"
+#include "ggml-backend-moe-cache.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -64,6 +64,7 @@ struct moe_cache_pool {
     char * slab2       = nullptr;   // gate weights (fusion operand), paired pools only
     bool   paired      = false;     // one entry covers the (gate, up) pair of an expert
     bool   is_down     = false;     // role == 2 (down projection) pool
+    bool   from_slab   = false;     // slab carved from the protected tail (not cudaFree-able)
     int    n_slots     = 0;
     int    n_used      = 0;
 
@@ -77,6 +78,12 @@ struct moe_cache_device {
     moe_cache_pool pools[MOE_CACHE_MAX_POOLS];
     int      n_pools = 0;
     bool     dead    = false;   // CUDA failure or trim: cache permanently off here
+
+    // protected tail slab carved from the compute buffer: the gallocr tail
+    // reserve keeps graph tensors out of it, so entries need no phase flush
+    char   * slab_base = nullptr;
+    size_t   slab_size = 0;
+    char   * slab_off = nullptr;   // bump cursor (== slab_base when empty)
 
     cudaStream_t compute_stream = nullptr;
 
@@ -190,6 +197,8 @@ struct moe_cache_global {
         bool done    = false;
     } backfill;
 
+    std::atomic<bool> in_prefill{false};
+
     // insert queue + workers
     std::mutex              mu;  // guards pools/queue of all devices
     std::condition_variable cv;
@@ -270,19 +279,23 @@ struct moe_cache_global {
     // Phase A (after pools build): eligible nodes run pure-CPU while their wall
     // time builds the baseline EWMA (begin returns -3 so the kernel reports the
     // sample). Phase B: cache engages; node walls feed the engaged EWMA. Once
-    // enough engaged samples accumulate, sustained engaged > baseline * 1.05
+    // enough engaged samples accumulate, sustained engaged > baseline * threshold_ratio (default 1.25)
     // disables the cache and frees its VRAM: the placement bet failed on this
     // workload and the CPU path is the better config.
     struct {
-        long long eligible_seen = 0;       // counts begins after pools exist
-        double    base_ewma = 0.0;         // pure-CPU node wall, us
-        double    on_ewma   = 0.0;         // cache-engaged node wall, us
+        bool      enabled         = true;  // GGML_CUDA_MOE_CACHE_BAIL=0 to disable
+        double    threshold_ratio = 1.25;  // GGML_CUDA_MOE_CACHE_BAIL_RATIO (default 1.25 = 25% slower)
+        int       max_strikes     = 16;    // GGML_CUDA_MOE_CACHE_BAIL_STRIKES (default 16 checks = 4096 nodes)
+        long long min_on_samples  = 20000; // min samples before judging (~100 decode tokens)
+        long long warm_samples    = 500;   // GGML_CUDA_MOE_CACHE_BAIL_WARM (ignored, first-touch effects)
+        long long sample_window   = 2750;  // GGML_CUDA_MOE_CACHE_BAIL_SAMPLE (baseline window end)
+        long long eligible_seen   = 0;     // counts begins after pools exist
+        double    base_ewma       = 0.0;   // pure-CPU per-token wall, us
+        double    on_ewma         = 0.0;   // cache-engaged per-token wall, us
         long long base_n = 0, on_n = 0;
-        int       strikes = 0;
-        bool      tripped = false;
+        int       strikes         = 0;
+        bool      tripped         = false;
     } bail;
-    static constexpr long long BAIL_WARM   = 500;   // ignored (first-touch effects)
-    static constexpr long long BAIL_SAMPLE = 2750;  // baseline window end
 };
 
 // intentionally leaked: detached worker threads reference this state through
@@ -465,14 +478,14 @@ static void moe_cache_worker_main(int wid) {
         moe_cache_job job;
         {
             std::unique_lock<std::mutex> lk(g.mu);
-            while (g.queue.empty()) {
-                if (g.backfill.enabled && g.backfill.active && !g.backfill.done && moe_cache_backfill_next(job)) {
+            while (g.in_prefill || g.queue.empty()) {
+                if (!g.in_prefill && g.backfill.enabled && g.backfill.active && !g.backfill.done && moe_cache_backfill_next(job)) {
                     goto have_job;
                 }
                 lk.unlock();
                 moe_cache_hotset_save_tick(wid);
                 lk.lock();
-                if (!g.queue.empty()) {
+                if (!g.in_prefill && !g.queue.empty()) {
                     break;
                 }
                 g.cv.wait_for(lk, std::chrono::milliseconds(50));
@@ -587,6 +600,18 @@ struct moe_cache_discovery {
 };
 static moe_cache_discovery g_disc;
 
+// carve an absolutely 256B-aligned region from the device's protected tail
+// slab (the slab base itself is not aligned: it starts at the layout size)
+static char * moe_cache_slab_carve(moe_cache_device & d, size_t size) {
+    if (!d.slab_base || size == 0) return nullptr;
+    char * p = d.slab_off ? d.slab_off : d.slab_base;
+    const uintptr_t a = (uintptr_t)p;
+    if (a & 255) p += 256 - (int)(a & 255);
+    if (p + size > d.slab_base + d.slab_size) return nullptr;
+    d.slab_off = p + size;
+    return p;
+}
+
 // build one pool for (size, wtype) on device di; caller ensures no duplicate
 static bool moe_cache_pool_alloc(int di, size_t expert_size, int wtype, size_t budget, bool paired,
                            int64_t max_entries, bool is_down) {
@@ -621,20 +646,34 @@ static bool moe_cache_pool_alloc(int di, size_t expert_size, int wtype, size_t b
     }
 
     char * slab = nullptr;
-    cudaError_t err = cudaMalloc((void **)&slab, (size_t)ns * expert_size);
-    if (err != cudaSuccess) {
-        cudaGetLastError();
-        MOE_CACHE_LOG("[moe-cache] dev=%d pool alloc failed: %s\n", di, cudaGetErrorString(err));
-        return false;
-    }
     char * slab2 = nullptr;
-    if (paired) {
-        err = cudaMalloc((void **)&slab2, (size_t)ns * expert_size);
+    bool from_slab = false;
+    if (d.slab_size > 0) {
+        // carve from the protected tail: one region covering both slabs, split
+        // in the middle (paired pools). Trimmable memory is untouched.
+        const size_t need = (size_t)ns * expert_size;
+        char * region = moe_cache_slab_carve(d, need * (paired ? 2 : 1));
+        if (region) {
+            slab = region;
+            slab2 = paired ? region + need : nullptr;
+            from_slab = true;
+        }
+    }
+    if (!from_slab) {
+        cudaError_t err = cudaMalloc((void **)&slab, (size_t)ns * expert_size);
         if (err != cudaSuccess) {
             cudaGetLastError();
-            cudaFree(slab);
-            MOE_CACHE_LOG("[moe-cache] dev=%d paired pool alloc failed: %s\n", di, cudaGetErrorString(err));
+            MOE_CACHE_LOG("[moe-cache] dev=%d pool alloc failed: %s\n", di, cudaGetErrorString(err));
             return false;
+        }
+        if (paired) {
+            err = cudaMalloc((void **)&slab2, (size_t)ns * expert_size);
+            if (err != cudaSuccess) {
+                cudaGetLastError();
+                cudaFree(slab);
+                MOE_CACHE_LOG("[moe-cache] dev=%d paired pool alloc failed: %s\n", di, cudaGetErrorString(err));
+                return false;
+            }
         }
     }
 
@@ -645,15 +684,17 @@ static bool moe_cache_pool_alloc(int di, size_t expert_size, int wtype, size_t b
     p.slab2       = slab2;
     p.paired      = paired;
     p.is_down     = is_down;
+    p.from_slab   = from_slab;
     p.n_slots     = ns;
     p.n_used      = 0;
     p.map.clear();
     p.lru_head = p.lru_tail = -1;
     p.slots.assign(ns, moe_cache_slot{0, -1, -1, false, false, -1, -1});
     d.n_pools++;
-    MOE_CACHE_LOG("[moe-cache] dev=%d pool[%d]: type=%d slot=%zu KB slots=%d total=%zu MB%s\n",
+    MOE_CACHE_LOG("[moe-cache] dev=%d pool[%d]: type=%d slot=%zu KB slots=%d total=%zu MB%s%s\n",
             di, d.n_pools - 1, wtype, expert_size >> 10, ns,
-            ((size_t)(paired ? 2 : 1) * ns * expert_size) >> 20, paired ? " (paired)" : (is_down ? " (down)" : ""));
+            ((size_t)(paired ? 2 : 1) * ns * expert_size) >> 20, paired ? " (paired)" : (is_down ? " (down)" : ""),
+            from_slab ? " [slab]" : "");
 
     if (!d.compute_stream) {
         CUDA_CHECK(cudaStreamCreateWithFlags(&d.compute_stream, cudaStreamNonBlocking));
@@ -822,10 +863,62 @@ static int moe_cache_begin(const char * name, const void * host_base, size_t exp
                      int64_t n_in, int64_t n_out, int wtype, int64_t n_expert, int64_t n_tokens) {
     GGML_UNUSED(n_in); GGML_UNUSED(n_out);
 
+    g.cur_n_tokens = n_tokens;
     moe_cache_gate_dbg_enter(name, n_tokens, expert_size, wtype, n_expert);
     if (!g.enabled || n_tokens < 1) { moe_cache_gate_dbg("disabled/nt0", name, n_tokens, expert_size, wtype, n_expert); return -1; }
     if (expert_size < g.min_expert_bytes) { moe_cache_gate_dbg("too_small", name, n_tokens, expert_size, wtype, n_expert); return -1; }
     const bool pp_phase = n_tokens > g.max_batch;   // discovery-only visit
+
+    if (pp_phase) {
+        if (!g.in_prefill) {
+            std::unique_lock<std::mutex> lk(g.mu);
+            g.in_prefill = true;
+            for (auto & j : g.queue) {
+                moe_cache_pool & p = g.dev[j.dev].pools[j.pool];
+                if (j.slot_idx >= 0 && j.slot_idx < (int)p.slots.size()) {
+                    p.slots[j.slot_idx].queued = false;
+                    p.map.erase(j.key);
+                }
+            }
+            g.queue.clear();
+            g.cv_idle.wait(lk, [&]{
+                for (int w = 0; w < 16; w++) if (g.inflight_src[w]) return false;
+                return true;
+            });
+        }
+    } else if (g.in_prefill) {
+        std::unique_lock<std::mutex> lk(g.mu);
+        g.in_prefill = false;
+        for (int di = 0; di < g.n_dev; di++) {
+            moe_cache_device & d = g.dev[di];
+            for (int i = 0; i < d.n_pools; i++) {
+                moe_cache_pool & p = d.pools[i];
+                if (!p.from_slab || !p.slab) continue;
+                p.map.clear();
+                p.n_used = 0;
+                p.lru_head = p.lru_tail = -1;
+                for (auto & s : p.slots) {
+                    s.valid = false;
+                    s.queued = false;
+                    s.prev = s.next = -1;
+                }
+            }
+        }
+        memset(g.resident_pair, 0, sizeof(g.resident_pair));
+        memset(g.resident_down, 0, sizeof(g.resident_down));
+        g.backfill.done = false;
+        g.backfill.phase = 0;
+        g.backfill.blk = 0;
+        g.backfill.eid = 0;
+
+        if (g.tail_seed_enabled && g.tail_seed_pending) {
+            if (moe_cache_enqueue_tail_seed()) {
+                g.tail_seed_pending = false;
+                memset(g.tail_seed, 0, sizeof(g.tail_seed));
+            }
+        }
+        g.cv.notify_all();
+    }
 
     // single-owner engagement: begin..collect carries per-node state in g.cur_*;
     // a second thread (concurrent llama_context) gets a clean refusal instead
@@ -1006,7 +1099,13 @@ static int moe_cache_begin(const char * name, const void * host_base, size_t exp
             size_t free_mem = 0, total_mem = 0;
             ggml_cuda_set_device(di);
             CUDA_CHECK(cudaMemGetInfo(&free_mem, &total_mem));
-            size_t avail = free_mem > reserve ? free_mem - reserve : 0;
+            size_t avail;
+            if (g.dev[di].slab_size > 0) {
+                // protected tail slab is the cache's VRAM: pools carve from it
+                avail = g.dev[di].slab_size;
+            } else {
+                avail = free_mem > reserve ? free_mem - reserve : 0;
+            }
             if (g.budget_mb > 0 && (g.budget_mb << 20) < avail) {
                 avail = g.budget_mb << 20;
             }
@@ -1116,7 +1215,7 @@ static int moe_cache_begin(const char * name, const void * host_base, size_t exp
         return -1;
     }
 
-    if (g.tail_seed_pending && g.tail_seed_enabled && g.bail.eligible_seen >= moe_cache_global::BAIL_WARM) {
+    if (g.tail_seed_pending && g.tail_seed_enabled) {
         std::lock_guard<std::mutex> lk(g.mu);
         if (moe_cache_enqueue_tail_seed()) {
             g.tail_seed_pending = false;
@@ -1125,14 +1224,14 @@ static int moe_cache_begin(const char * name, const void * host_base, size_t exp
     }
 
     // bail-out phases (decode visits on a working pool only)
-    if (!g.bail.tripped) {
+    if (g.bail.enabled && !g.bail.tripped) {
         const long long vis = g.bail.eligible_seen++;
-        if (vis < moe_cache_global::BAIL_WARM) { moe_cache_gate_dbg("warmup", name, n_tokens, expert_size, wtype, n_expert); return -1; }        // warmup: no sample
-        if (vis < moe_cache_global::BAIL_SAMPLE) { moe_cache_gate_dbg("sample", name, n_tokens, expert_size, wtype, n_expert); return -3; }      // pure CPU + timing sample
+        if (vis < g.bail.warm_samples) { moe_cache_gate_dbg("warmup", name, n_tokens, expert_size, wtype, n_expert); return -1; }        // warmup: no sample
+        if (vis < g.bail.sample_window) { moe_cache_gate_dbg("sample", name, n_tokens, expert_size, wtype, n_expert); return -3; }      // pure CPU + timing sample
     }
 
     // paired pools share ONE entry per (blk, expert): key by blk + the GATE
-    // tensor's host base (two models in one process must never alias — names
+    // tensor's host base (two models in one process must never alias - names
     // and blk indices collide across models, data pointers do not)
     if (d.pools[pi].paired && (role == 0 || role == 1)) {
         if (blk >= 0 && blk < 1024) g.role_base[role][blk] = host_base;
@@ -1805,6 +1904,15 @@ extern "C" size_t ggml_moe_cache_trim(int device) {
     size_t freed = 0;
     for (int i = 0; i < d.n_pools; i++) {
         moe_cache_pool & p = d.pools[i];
+        if (p.from_slab) {
+            // slab memory belongs to the compute buffer: drop entries only.
+            // note: trim is terminal graceful degradation (cache off on this device).
+            p.map.clear();
+            p.slab = p.slab2 = nullptr;
+            p.n_slots = 0;
+            p.n_used  = 0;
+            continue;
+        }
         if (p.slab)  { freed += (size_t)p.n_slots * p.expert_size; cudaFree(p.slab);  p.slab  = nullptr; }
         if (p.slab2) { freed += (size_t)p.n_slots * p.expert_size; cudaFree(p.slab2); p.slab2 = nullptr; }
         p.map.clear();
@@ -1821,9 +1929,80 @@ extern "C" size_t ggml_moe_cache_trim(int device) {
     memset(g.resident_pair, 0, sizeof(g.resident_pair));
     memset(g.resident_down, 0, sizeof(g.resident_down));
     d.dead = true;
-    MOE_CACHE_LOG("[moe-cache] dev=%d TRIMMED %zu MB under VRAM pressure — cache off on this device\n",
+    MOE_CACHE_LOG("[moe-cache] dev=%d TRIMMED %zu MB under VRAM pressure - cache off on this device\n",
             device, freed >> 20);
     return freed;
+}
+
+// ---- API: protected tail slab -----------------------------------------------------------
+//
+// The idle tail of the monolithic compute buffer during decode is aliased as
+// the cache's VRAM. set_vram_slab() configures the resulting region. Pools
+// carve from it instead of cudaMalloc.
+
+static void moe_cache_set_vram_slab(void * base, size_t size) {
+    if (!g.enabled) return;
+    int cur_dev = 0;
+    cudaGetDevice(&cur_dev);
+    int di = -1;
+    if (base) {
+        for (int i = 0; i < g.n_dev; i++) {
+            ggml_cuda_set_device(i);
+            cudaPointerAttributes attr;
+            if (cudaPointerGetAttributes(&attr, base) != cudaSuccess) {
+                cudaGetLastError();
+                continue;
+            }
+            if (attr.type == cudaMemoryTypeDevice) {
+                di = (attr.device >= 0 && attr.device < g.n_dev) ? attr.device : i;
+                break;
+            }
+        }
+    }
+    cudaSetDevice(cur_dev);
+    if (di < 0) {
+        MOE_CACHE_LOG("[moe-cache] slab set: base %p not found on any device\n", base);
+        return;
+    }
+    moe_cache_device & d = g.dev[di];
+    std::unique_lock<std::mutex> lk(g.mu);
+
+    // wait out in-flight inserts: their copies target the OLD slab memory, and
+    // the post-copy slot bookkeeping must not race the flush below
+    g.cv_idle.wait(lk, [&]{
+        for (int w = 0; w < 16; w++) if (g.inflight_src[w]) return false;
+        return true;
+    });
+
+    // the old slab's memory is gone with the old compute buffer: drop all
+    // entries backed by it, then re-carve the pools with the same footprint
+    for (int i = 0; i < d.n_pools; i++) {
+        moe_cache_pool & p = d.pools[i];
+        if (!p.from_slab || !p.slab) continue;
+        p.map.clear();
+        p.n_used = 0;
+        p.lru_head = p.lru_tail = -1;
+        for (auto & s : p.slots) { s.valid = false; s.queued = false; s.prev = s.next = -1; }
+    }
+    d.slab_base = (char *) base;
+    d.slab_size = size;
+    d.slab_off  = d.slab_base;
+    for (int i = 0; i < d.n_pools; i++) {
+        moe_cache_pool & p = d.pools[i];
+        if (!p.from_slab || !p.n_slots) continue;
+        const size_t need = (size_t)p.n_slots * p.expert_size;
+        char * region = moe_cache_slab_carve(d, need * (p.paired ? 2 : 1));
+        if (!region) {
+            // no longer fits: kill the pool (same semantics as an alloc failure)
+            p.slab = p.slab2 = nullptr;
+            p.from_slab = false;
+            p.n_slots = 0;
+            continue;
+        }
+        p.slab = region;
+        p.slab2 = p.paired ? region + need : nullptr;
+    }
+    MOE_CACHE_LOG("[moe-cache] dev=%d slab set: %zu MB (base=%p), %d pools re-carved\n", di, size >> 20, base, d.n_pools);
 }
 
 // ---- API: invalidate (host weight buffer teardown) -------------------------------------
@@ -1873,24 +2052,26 @@ static void moe_cache_invalidate(const void * base, size_t size) {
 // ---- API: node wall-time samples (bail-out) ---------------------------------------------
 
 static void moe_cache_node_time(int code, int64_t us) {
-    if (g.bail.tripped) return;
+    if (!g.bail.enabled || g.bail.tripped) return;
     auto & b = g.bail;
+    const int64_t n_tok = g.cur_n_tokens > 0 ? g.cur_n_tokens : 1;
+    const double per_tok_us = (double)us / n_tok;
     if (code == -3) {
-        b.base_ewma = b.base_n == 0 ? (double)us : b.base_ewma + ((double)us - b.base_ewma) / 256.0;
+        b.base_ewma = b.base_n == 0 ? per_tok_us : b.base_ewma + (per_tok_us - b.base_ewma) / 256.0;
         b.base_n++;
         return;
     }
     if (code < 0) return;
-    b.on_ewma = b.on_n == 0 ? (double)us : b.on_ewma + ((double)us - b.on_ewma) / 256.0;
+    b.on_ewma = b.on_n == 0 ? per_tok_us : b.on_ewma + (per_tok_us - b.on_ewma) / 256.0;
     b.on_n++;
-    if (b.base_n < 1000 || b.on_n < 5000) return;
+    if (b.base_n < 1000 || b.on_n < b.min_on_samples) return;
     if (b.on_n % 256 != 0) return;
-    if (b.on_ewma > b.base_ewma * 1.05) {
-        if (++b.strikes >= 4) {
+    if (b.on_ewma > b.base_ewma * b.threshold_ratio) {
+        if (++b.strikes >= b.max_strikes) {
             b.tripped = true;
-            MOE_CACHE_LOG("[moe-cache] bail-out: cache-engaged nodes average %.0fus vs %.0fus pure-CPU — "
+            MOE_CACHE_LOG("[moe-cache] bail-out: cache-engaged nodes average %.1fus vs %.1fus pure-CPU (threshold %.2fx) - "
                     "disabling the cache and freeing its VRAM for this run\n",
-                    b.on_ewma, b.base_ewma);
+                    b.on_ewma, b.base_ewma, b.threshold_ratio);
             for (int di = 0; di < g.n_dev; di++) {
                 ggml_moe_cache_trim(di);
             }
@@ -1935,8 +2116,9 @@ static void moe_cache_stats(void) {
             if (i == 0) {
                 MOE_CACHE_LOG("[moe-cache] tail-seed: preloaded=%lld enabled=%d pending=%d\n",
                         g.tail_seed_enqueued, (int)g.tail_seed_enabled, (int)g.tail_seed_pending);
-                MOE_CACHE_LOG("[moe-cache] bail-ewma: base=%.1fus(n=%lld) on=%.1fus(n=%lld)\n",
-                        g.bail.base_ewma, g.bail.base_n, g.bail.on_ewma, g.bail.on_n);
+                MOE_CACHE_LOG("[moe-cache] bail-ewma: base=%.1fus(n=%lld) on=%.1fus(n=%lld) strikes=%d/%d enabled=%d\n",
+                        g.bail.base_ewma, g.bail.base_n, g.bail.on_ewma, g.bail.on_n,
+                        g.bail.strikes, g.bail.max_strikes, (int)g.bail.enabled);
             }
         }
     }
@@ -2088,6 +2270,11 @@ void ggml_moe_cache_register(void) {
     if (const char * e = getenv("GGML_CUDA_MOE_CACHE_DECAY_TOKENS"))        { int n = atoi(e); if (n >= 1) g.freq.decay_tokens = n; }
     if (const char * e = getenv("GGML_CUDA_MOE_CACHE_SEQUENTIAL_BACKFILL")) g.sequential_backfill = atoi(e) > 0;
     if (const char * e = getenv("GGML_CUDA_MOE_CACHE_MTP_BLK"))             { int n = atoi(e); if (n >= 0) g.mtp_blk = n; }
+    if (const char * e = getenv("GGML_CUDA_MOE_CACHE_BAIL"))                 g.bail.enabled = atoi(e) > 0;
+    if (const char * e = getenv("GGML_CUDA_MOE_CACHE_BAIL_RATIO"))           { double r = atof(e); if (r >= 1.0) g.bail.threshold_ratio = r; }
+    if (const char * e = getenv("GGML_CUDA_MOE_CACHE_BAIL_STRIKES"))         { int s = atoi(e); if (s >= 1) g.bail.max_strikes = s; }
+    if (const char * e = getenv("GGML_CUDA_MOE_CACHE_BAIL_WARM"))            { long long w = atoll(e); if (w >= 0) g.bail.warm_samples = w; }
+    if (const char * e = getenv("GGML_CUDA_MOE_CACHE_BAIL_SAMPLE"))          { long long s = atoll(e); if (s >= 0) g.bail.sample_window = s; }
     g.hotset_last_save = ggml_time_us();   // first save no sooner than one period in
     for (int i = 0; i < MOE_CACHE_MAX_DEV; i++) { g_disc.min_blk[i] = 1 << 30; }
     memset(g.blk_pair_pool, -1, sizeof(g.blk_pair_pool));
@@ -2104,6 +2291,7 @@ void ggml_moe_cache_register(void) {
     ggml_moe_cache.invalidate        = moe_cache_invalidate;
     ggml_moe_cache.node_time         = moe_cache_node_time;
     ggml_moe_cache.tail_seed_record  = moe_cache_tail_seed_record;
+    ggml_moe_cache.set_vram_slab     = moe_cache_set_vram_slab;
     if (const char * e = getenv("GGML_CUDA_MOE_CACHE_REDIRECT")) g.redirect_on = atoi(e) > 0;
 
     MOE_CACHE_LOG("[moe-cache] enabled: n_dev=%d budget=%s inserts/plan=%d workers=%d stats_every=%d\n",
