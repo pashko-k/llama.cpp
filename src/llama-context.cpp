@@ -1432,6 +1432,10 @@ bool llama_context::set_adapter_cvec(
 }
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+    if (ggml_moe_cache.set_prefill) {
+        ggml_moe_cache.set_prefill(ubatch.n_tokens > 8);
+    }
+
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
@@ -1484,18 +1488,32 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         // MoE cache invariant checks
         for (size_t i = 0; i < backend_ptrs.size(); ++i) {
             if (i < moe_cache_tg_reserves.size() && moe_cache_tg_reserves[i] > 0) {
+                ggml_gallocr_t galloc = ggml_backend_sched_get_gallocr(sched.get());
+                ggml_backend_buffer_t chunk0 = galloc ? ggml_gallocr_get_buffer_chunk(galloc, (int) i, 0) : nullptr;
+                size_t max_off = 0;
+                if (chunk0) {
+                    char * base = (char *) ggml_backend_buffer_get_base(chunk0);
+                    size_t bsize = ggml_backend_buffer_get_size(chunk0);
+                    const int n_nodes = ggml_graph_n_nodes(gf);
+                    for (int n = 0; n < n_nodes; ++n) {
+                        struct ggml_tensor * node = ggml_graph_node(gf, n);
+                        char * ptr = (char *) node->data;
+                        if (ptr >= base && ptr < base + bsize) {
+                            size_t off = (ptr - base) + ggml_nbytes(node);
+                            if (off > max_off) {
+                                max_off = off;
+                            }
+                        }
+                    }
+                }
                 if (ubatch.n_tokens <= 8) {
-                    const size_t cur_size = ggml_backend_sched_get_graph_size(sched.get(), backend_ptrs[i]);
-                    GGML_ASSERT(cur_size <= moe_cache_tg_reserves[i] && "MoE cache slab overrun: decode graph exceeded tg_reserve");
+                    GGML_ASSERT(max_off <= moe_cache_tg_reserves[i] && "MoE cache slab overrun: decode graph exceeded tg_reserve");
                 }
 
                 // check if the compute buffer base moved due to reallocation
-                ggml_gallocr_t galloc = ggml_backend_sched_get_gallocr(sched.get());
-                if (galloc && ggml_moe_cache.set_vram_slab) {
-                    ggml_backend_buffer_t chunk0 = ggml_gallocr_get_buffer_chunk(galloc, (int) i, 0);
-                    if (chunk0) {
-                        void * cur_base = ggml_backend_buffer_get_base(chunk0);
-                        if (cur_base != moe_cache_tg_bases[i]) {
+                if (galloc && ggml_moe_cache.set_vram_slab && chunk0) {
+                    void * cur_base = ggml_backend_buffer_get_base(chunk0);
+                    if (cur_base != moe_cache_tg_bases[i]) {
                             const size_t bsize = ggml_backend_buffer_get_size(chunk0);
                             if (bsize > moe_cache_tg_reserves[i]) {
                                 const size_t slab_size = bsize - moe_cache_tg_reserves[i];
@@ -1507,7 +1525,6 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                     }
                 }
             }
-        }
 
         gf_res_prev_active = res;
     }

@@ -1673,12 +1673,11 @@ static void ggml_compute_forward_mul_mat_id(
         // from the CPU row mapping. The GPU computes them while the threadpool
         // computes the remaining rows; results land in dst in the collect step
         // at the end of this function, before the node completes.
-        if (ggml_moe_cache.begin && src1->type == GGML_TYPE_F32 &&
-            n_ids * ids->ne[1] <= MOE_CACHE_MAX_TOPK) {
+        if (ggml_moe_cache.begin && src1->type == GGML_TYPE_F32) {
             moe_cache_t0 = ggml_time_us();
             moe_cache_dev = ggml_moe_cache.begin(src0->name, src0->data, nb02,
                                                  ne00, ne01, (int) type, ne02, ids->ne[1]);
-            if (moe_cache_dev >= 0) {
+            if (moe_cache_dev >= 0 && n_ids * ids->ne[1] <= MOE_CACHE_MAX_TOPK) {
                 int32_t moe_cache_ids[MOE_CACHE_MAX_TOPK];
                 for (int64_t iid1 = 0; iid1 < ids->ne[1]; ++iid1) {
                     for (int id = 0; id < n_ids; ++id) {
@@ -1719,7 +1718,14 @@ static void ggml_compute_forward_mul_mat_id(
                     moe_cache_acts[moe_cache_n_hits]    = (const float *) ((const char *) src1->data + i11*nb11 + iid1*nb12);
                     moe_cache_rows[moe_cache_n_hits]    = (float *) ((char *) dst->data + iid1*nb2 + id*nb1);
                     moe_cache_n_hits++;
-                    continue;
+                    static int shadow_cpu = -1;
+                    if (shadow_cpu < 0) {
+                        const char * s = getenv("GGML_CUDA_MOE_CACHE_SHADOW");
+                        shadow_cpu = s ? atoi(s) : 0;
+                    }
+                    if (!shadow_cpu) {
+                        continue;
+                    }
                 }
 
                 MMID_MATRIX_ROW(i02, matrix_row_counts[i02]) = (struct mmid_row_mapping) {id, iid1};

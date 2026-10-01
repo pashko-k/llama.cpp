@@ -535,6 +535,18 @@ static void moe_cache_worker_main(int wid) {
             }
         }
 
+        if (err == cudaSuccess) {
+            char vbuf[64] = {};
+            cudaMemcpy(vbuf, dst, 64, cudaMemcpyDeviceToHost);
+            if (memcmp(vbuf, job.src, 64) != 0) {
+                static int bad_cp = 0;
+                if (bad_cp++ < 10) {
+                    fprintf(stderr, "[moe-cache-bad-copy] dev=%d blk=%d eid=%d si=%d dst=%p src=%p\n",
+                            job.dev, job.blk, job.eid, job.slot_idx, (void *)dst, job.src);
+                }
+            }
+        }
+
         {
             std::lock_guard<std::mutex> lk(g.mu);
             g.inflight_src[wid] = nullptr;
@@ -857,6 +869,66 @@ static bool moe_cache_enqueue_tail_seed(void) {
     return true;
 }
 
+static void moe_cache_set_prefill(bool in_prefill) {
+    if (!g.enabled) return;
+    if (in_prefill) {
+        if (!g.in_prefill) {
+            std::unique_lock<std::mutex> lk(g.mu);
+            if (!g.in_prefill) {
+                g.in_prefill = true;
+                MOE_CACHE_LOG("[moe-cache] entering prefill phase, pausing workers and draining queue\n");
+                for (auto & j : g.queue) {
+                    moe_cache_pool & p = g.dev[j.dev].pools[j.pool];
+                    if (j.slot_idx >= 0 && j.slot_idx < (int)p.slots.size()) {
+                        p.slots[j.slot_idx].queued = false;
+                        p.map.erase(j.key);
+                    }
+                }
+                g.queue.clear();
+                g.cv_idle.wait(lk, [&]{
+                    for (int w = 0; w < 16; w++) if (g.inflight_src[w]) return false;
+                    return true;
+                });
+            }
+        }
+    } else if (g.in_prefill) {
+        std::unique_lock<std::mutex> lk(g.mu);
+        if (g.in_prefill) {
+            g.in_prefill = false;
+            MOE_CACHE_LOG("[moe-cache] exiting prefill phase -> decode, flushed slab pools\n");
+            for (int di = 0; di < g.n_dev; di++) {
+                moe_cache_device & d = g.dev[di];
+                for (int i = 0; i < d.n_pools; i++) {
+                    moe_cache_pool & p = d.pools[i];
+                    if (!p.from_slab || !p.slab) continue;
+                    p.map.clear();
+                    p.n_used = 0;
+                    p.lru_head = p.lru_tail = -1;
+                    for (auto & s : p.slots) {
+                        s.valid = false;
+                        s.queued = false;
+                        s.prev = s.next = -1;
+                    }
+                }
+            }
+            memset(g.resident_pair, 0, sizeof(g.resident_pair));
+            memset(g.resident_down, 0, sizeof(g.resident_down));
+            g.backfill.done = false;
+            g.backfill.phase = 0;
+            g.backfill.blk = 0;
+            g.backfill.eid = 0;
+
+            if (g.tail_seed_enabled && g.tail_seed_pending) {
+                if (moe_cache_enqueue_tail_seed()) {
+                    g.tail_seed_pending = false;
+                    memset(g.tail_seed, 0, sizeof(g.tail_seed));
+                }
+            }
+            g.cv.notify_all();
+        }
+    }
+}
+
 // ---- API: begin -----------------------------------------------------------------
 
 static int moe_cache_begin(const char * name, const void * host_base, size_t expert_size,
@@ -869,56 +941,7 @@ static int moe_cache_begin(const char * name, const void * host_base, size_t exp
     if (expert_size < g.min_expert_bytes) { moe_cache_gate_dbg("too_small", name, n_tokens, expert_size, wtype, n_expert); return -1; }
     const bool pp_phase = n_tokens > g.max_batch;   // discovery-only visit
 
-    if (pp_phase) {
-        if (!g.in_prefill) {
-            std::unique_lock<std::mutex> lk(g.mu);
-            g.in_prefill = true;
-            for (auto & j : g.queue) {
-                moe_cache_pool & p = g.dev[j.dev].pools[j.pool];
-                if (j.slot_idx >= 0 && j.slot_idx < (int)p.slots.size()) {
-                    p.slots[j.slot_idx].queued = false;
-                    p.map.erase(j.key);
-                }
-            }
-            g.queue.clear();
-            g.cv_idle.wait(lk, [&]{
-                for (int w = 0; w < 16; w++) if (g.inflight_src[w]) return false;
-                return true;
-            });
-        }
-    } else if (g.in_prefill) {
-        std::unique_lock<std::mutex> lk(g.mu);
-        g.in_prefill = false;
-        for (int di = 0; di < g.n_dev; di++) {
-            moe_cache_device & d = g.dev[di];
-            for (int i = 0; i < d.n_pools; i++) {
-                moe_cache_pool & p = d.pools[i];
-                if (!p.from_slab || !p.slab) continue;
-                p.map.clear();
-                p.n_used = 0;
-                p.lru_head = p.lru_tail = -1;
-                for (auto & s : p.slots) {
-                    s.valid = false;
-                    s.queued = false;
-                    s.prev = s.next = -1;
-                }
-            }
-        }
-        memset(g.resident_pair, 0, sizeof(g.resident_pair));
-        memset(g.resident_down, 0, sizeof(g.resident_down));
-        g.backfill.done = false;
-        g.backfill.phase = 0;
-        g.backfill.blk = 0;
-        g.backfill.eid = 0;
-
-        if (g.tail_seed_enabled && g.tail_seed_pending) {
-            if (moe_cache_enqueue_tail_seed()) {
-                g.tail_seed_pending = false;
-                memset(g.tail_seed, 0, sizeof(g.tail_seed));
-            }
-        }
-        g.cv.notify_all();
-    }
+    moe_cache_set_prefill(pp_phase);
 
     // single-owner engagement: begin..collect carries per-node state in g.cur_*;
     // a second thread (concurrent llama_context) gets a clean refusal instead
@@ -1772,10 +1795,93 @@ static void moe_cache_collect(int di, int n_hits, float * const * dst_rows, int6
     const bool cok = !d.dead && d.h_out && d.d_out
         && moe_cache_ok(di, cudaMemcpyAsync(d.h_out, d.d_out, bytes, cudaMemcpyDeviceToHost, d.compute_stream), "collect D2H")
         && moe_cache_ok(di, cudaStreamSynchronize(d.compute_stream), "collect sync");
-    MOE_CACHE_DBG("[moe-cache-dbg] collect dev=%d post-sync\n", di);
-    for (int i = 0; i < n_hits; i++) {
-        if (cok) memcpy(dst_rows[i], d.h_out + (size_t)i * n_out, n_out * sizeof(float));
-        else     memset(dst_rows[i], 0, n_out * sizeof(float));
+    static int shadow_mode = -1;
+    if (shadow_mode < 0) {
+        const char * s = getenv("GGML_CUDA_MOE_CACHE_SHADOW");
+        shadow_mode = s ? atoi(s) : 0;
+    }
+    if (cok) {
+        static int n_logged = 0;
+        for (int i = 0; i < n_hits; i++) {
+            const float * gpu_row = d.h_out + (size_t)i * n_out;
+            const float * cpu_row = dst_rows[i];
+            float max_diff = 0.0f;
+            float max_cpu = 0.0f;
+            float max_gpu = 0.0f;
+            for (int64_t j = 0; j < n_out; j++) {
+                float diff = fabsf(gpu_row[j] - cpu_row[j]);
+                if (diff > max_diff) max_diff = diff;
+                if (fabsf(cpu_row[j]) > max_cpu) max_cpu = fabsf(cpu_row[j]);
+                if (fabsf(gpu_row[j]) > max_gpu) max_gpu = fabsf(gpu_row[j]);
+            }
+            float rel_diff = max_cpu > 0.0f ? max_diff / max_cpu : max_diff;
+            int si = d.h_ids ? d.h_ids[i] : -1;
+            const moe_cache_pool & p = d.pools[g.cur_pool];
+            int s_blk = -1, s_eid = -1, s_valid = -1;
+            int mem_cmp = -999;
+            if (si >= 0 && si < p.n_slots) {
+                const auto & s = p.slots[si];
+                s_blk = s.blk; s_eid = s.eid; s_valid = (int)s.valid;
+                if (p.slab && s.blk >= 0 && s.blk < 1024 && g.blk_down_base[s.blk]) {
+                    char w_gpu[64] = {}, w_cpu[64] = {};
+                    cudaMemcpy(w_gpu, p.slab + (size_t)si * p.expert_size, 64, cudaMemcpyDeviceToHost);
+                    const char * src_cpu = (const char *)g.blk_down_base[s.blk] + (size_t)s.eid * p.expert_size;
+                    memcpy(w_cpu, src_cpu, 64);
+                    mem_cmp = memcmp(w_gpu, w_cpu, 64);
+                }
+            }
+            if (n_logged < 100 || rel_diff > 0.15f) {
+                if (n_logged < 200) {
+                    n_logged++;
+                    fprintf(stderr, "[moe-cache-verify] dev=%d blk=%d role=%d pool=%d hit=%d/%d si=%d s_blk=%d s_eid=%d vld=%d wcmp=%d max_diff=%.4f max_cpu=%.4f max_gpu=%.4f rel=%.4f gpu[0..3]=[%.3f,%.3f,%.3f,%.3f] cpu[0..3]=[%.3f,%.3f,%.3f,%.3f]\n",
+                            di, g.cur_blk, g.cur_role, g.cur_pool, i, n_hits, si, s_blk, s_eid, s_valid, mem_cmp,
+                            max_diff, max_cpu, max_gpu, rel_diff,
+                            gpu_row[0], gpu_row[1], gpu_row[2], gpu_row[3],
+                            cpu_row[0], cpu_row[1], cpu_row[2], cpu_row[3]);
+                    if (mem_cmp != 0 && mem_cmp != -999) {
+                        char w_gpu[16] = {}, w_cpu[16] = {};
+                        cudaMemcpy(w_gpu, p.slab + (size_t)si * p.expert_size, 16, cudaMemcpyDeviceToHost);
+                        const char * src_cpu = (const char *)g.blk_down_base[s_blk] + (size_t)s_eid * p.expert_size;
+                        memcpy(w_cpu, src_cpu, 16);
+                        fprintf(stderr, "  w_gpu hex: %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x\n",
+                                (unsigned char)w_gpu[0], (unsigned char)w_gpu[1], (unsigned char)w_gpu[2], (unsigned char)w_gpu[3],
+                                (unsigned char)w_gpu[4], (unsigned char)w_gpu[5], (unsigned char)w_gpu[6], (unsigned char)w_gpu[7],
+                                (unsigned char)w_gpu[8], (unsigned char)w_gpu[9], (unsigned char)w_gpu[10], (unsigned char)w_gpu[11],
+                                (unsigned char)w_gpu[12], (unsigned char)w_gpu[13], (unsigned char)w_gpu[14], (unsigned char)w_gpu[15]);
+                        fprintf(stderr, "  w_cpu hex: %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x\n",
+                                (unsigned char)w_cpu[0], (unsigned char)w_cpu[1], (unsigned char)w_cpu[2], (unsigned char)w_cpu[3],
+                                (unsigned char)w_cpu[4], (unsigned char)w_cpu[5], (unsigned char)w_cpu[6], (unsigned char)w_cpu[7],
+                                (unsigned char)w_cpu[8], (unsigned char)w_cpu[9], (unsigned char)w_cpu[10], (unsigned char)w_cpu[11],
+                                (unsigned char)w_cpu[12], (unsigned char)w_cpu[13], (unsigned char)w_cpu[14], (unsigned char)w_cpu[15]);
+                        int found_blk = -1, found_eid = -1;
+                        for (int b = 0; b < 1024; b++) {
+                            if (!g.blk_down_base[b]) continue;
+                            for (int e = 0; e < 512; e++) {
+                                const char * cand = (const char *)g.blk_down_base[b] + (size_t)e * p.expert_size;
+                                if (memcmp(cand, w_gpu, 16) == 0) {
+                                    found_blk = b; found_eid = e; break;
+                                }
+                            }
+                            if (found_blk >= 0) break;
+                        }
+                        if (found_blk >= 0) {
+                            fprintf(stderr, "  w_gpu matches down_base blk=%d eid=%d (expected s_blk=%d s_eid=%d)!\n",
+                                    found_blk, found_eid, s_blk, s_eid);
+                        } else {
+                            const float * f4 = (const float *)w_gpu;
+                            fprintf(stderr, "  w_gpu NOT in down_base! As floats: [%.4e, %.4e, %.4e, %.4e]\n",
+                                    f4[0], f4[1], f4[2], f4[3]);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if (!shadow_mode) {
+        for (int i = 0; i < n_hits; i++) {
+            if (cok) memcpy(dst_rows[i], d.h_out + (size_t)i * n_out, n_out * sizeof(float));
+            else     memset(dst_rows[i], 0, n_out * sizeof(float));
+        }
     }
     d.out_rows   = 0;
     d.q8_act_ptr = nullptr;
@@ -2224,11 +2330,14 @@ static bool moe_cache_selftest_one(int di, ggml_type wtype, int64_t n_in, int64_
 
 static void moe_cache_selftest(void) {
     bool all = true;
-    all &= moe_cache_selftest_one(0, GGML_TYPE_Q4_K, 2048, 768,  8, true);
-    all &= moe_cache_selftest_one(0, GGML_TYPE_Q4_K, 768,  2048, 8, false);
-    all &= moe_cache_selftest_one(0, GGML_TYPE_Q4_K, 2048, 768,  1, true);
-    all &= moe_cache_selftest_one(0, GGML_TYPE_Q6_K, 2048, 768,  5, true);
-    all &= moe_cache_selftest_one(0, GGML_TYPE_Q6_K, 512,  2048, 8, false);
+    all &= moe_cache_selftest_one(0, GGML_TYPE_Q4_K,   2048, 768,  8, true);
+    all &= moe_cache_selftest_one(0, GGML_TYPE_Q4_K,   768,  2048, 8, false);
+    all &= moe_cache_selftest_one(0, GGML_TYPE_Q4_K,   2048, 768,  1, true);
+    all &= moe_cache_selftest_one(0, GGML_TYPE_Q6_K,   2048, 768,  5, true);
+    all &= moe_cache_selftest_one(0, GGML_TYPE_Q6_K,   512,  2048, 8, false);
+    all &= moe_cache_selftest_one(0, GGML_TYPE_IQ4_NL, 2048, 768,  8, true);
+    all &= moe_cache_selftest_one(0, GGML_TYPE_IQ3_S,  2048, 768,  8, true);
+    all &= moe_cache_selftest_one(0, GGML_TYPE_IQ2_S,  2048, 768,  8, true);
     MOE_CACHE_LOG("[moe-cache-selftest] %s\n", all ? "ALL PASS" : "FAILURES PRESENT");
 }
 
@@ -2292,6 +2401,7 @@ void ggml_moe_cache_register(void) {
     ggml_moe_cache.node_time         = moe_cache_node_time;
     ggml_moe_cache.tail_seed_record  = moe_cache_tail_seed_record;
     ggml_moe_cache.set_vram_slab     = moe_cache_set_vram_slab;
+    ggml_moe_cache.set_prefill       = moe_cache_set_prefill;
     if (const char * e = getenv("GGML_CUDA_MOE_CACHE_REDIRECT")) g.redirect_on = atoi(e) > 0;
 
     MOE_CACHE_LOG("[moe-cache] enabled: n_dev=%d budget=%s inserts/plan=%d workers=%d stats_every=%d\n",

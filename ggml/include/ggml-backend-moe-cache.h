@@ -94,6 +94,11 @@ struct ggml_moe_cache_api {
     // base is a device pointer inside the compute buffer; size == 0 clears it.
     // A change of base/size invalidates all entries backed by the old slab.
     void (*set_vram_slab)(void * base, size_t size);
+
+    // Notify the cache of prefill phase transitions.
+    // When in_prefill is true: drains insert queue, waits out in-flight copies, pauses workers.
+    // When false: flushes slab-backed pools, enqueues tail seeds, resumes workers.
+    void (*set_prefill)(bool in_prefill);
 };
 
 // Zero-initialized in ggml-backend.cpp; populated by the CUDA backend in
