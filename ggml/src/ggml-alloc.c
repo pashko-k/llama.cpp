@@ -1124,6 +1124,39 @@ ggml_backend_buffer_t ggml_gallocr_get_buffer_chunk(ggml_gallocr_t galloc, int b
     return galloc->buffers[buffer_id]->chunks[chunk_id];
 }
 
+bool ggml_gallocr_expand_buffer_chunk(ggml_gallocr_t galloc, int buffer_id, int chunk_id, size_t new_size) {
+    GGML_ASSERT(galloc != NULL);
+    GGML_ASSERT(buffer_id >= 0 && buffer_id < galloc->n_buffers);
+    GGML_ASSERT(chunk_id >= 0 && chunk_id < GGML_VBUFFER_MAX_CHUNKS);
+    struct vbuffer * vbuf = galloc->buffers[buffer_id];
+    if (!vbuf || !vbuf->chunks[chunk_id]) {
+        return false;
+    }
+    ggml_backend_buffer_t old_chunk = vbuf->chunks[chunk_id];
+    size_t old_size = ggml_backend_buffer_get_size(old_chunk);
+    if (new_size <= old_size) {
+        return true;
+    }
+    ggml_backend_buffer_type_t buft = galloc->bufts[buffer_id];
+    enum ggml_backend_buffer_usage usage = ggml_backend_buffer_get_usage(old_chunk);
+
+    ggml_backend_buffer_free(old_chunk);
+    vbuf->chunks[chunk_id] = NULL;
+
+    ggml_backend_buffer_t new_chunk = ggml_backend_buft_alloc_buffer(buft, new_size);
+    if (!new_chunk) {
+        // the old chunk is gone: the original size must succeed or the allocator is broken
+        new_chunk = ggml_backend_buft_alloc_buffer(buft, old_size);
+        GGML_ASSERT(new_chunk != NULL);
+        vbuf->chunks[chunk_id] = new_chunk;
+        ggml_backend_buffer_set_usage(new_chunk, usage);
+        return false;
+    }
+    ggml_backend_buffer_set_usage(new_chunk, usage);
+    vbuf->chunks[chunk_id] = new_chunk;
+    return true;
+}
+
 size_t ggml_gallocr_get_graph_size(ggml_gallocr_t galloc, int buffer_id) {
     GGML_ASSERT(galloc != NULL);
     GGML_ASSERT(buffer_id >= 0 && buffer_id < galloc->n_buffers);

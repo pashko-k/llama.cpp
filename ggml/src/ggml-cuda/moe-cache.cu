@@ -161,9 +161,11 @@ struct moe_cache_global {
     bool   enabled  = false;
     int    n_dev    = 0;
     size_t budget_mb = 0;        // 0 = auto (free VRAM at init minus reserve)
-    size_t reserve_mb = 3072;    // VRAM left untouched per device: the CUDA pool
+    size_t reserve_mb = 512;     // VRAM left untouched per device: the CUDA pool
                                  // grows lazily AFTER our init; stealing it
-                                 // crashes the model mid-decode (measured)
+                                 // crashes the model mid-decode (measured).
+                                 // Also the safety margin llama-context keeps when
+                                 // expanding the compute buffer for the tail slab
     int    inserts_per_plan = 8; // max inserts enqueued per plan() call
     int    throttle_mod     = 8; // at capacity admit 1-in-N misses (GGML_CUDA_MOE_CACHE_THROTTLE)
     int    queue_max        = 512;
@@ -2319,6 +2321,10 @@ static void moe_cache_selftest(void) {
     MOE_CACHE_LOG("[moe-cache-selftest] %s\n", all ? "ALL PASS" : "FAILURES PRESENT");
 }
 
+static size_t moe_cache_reserve_bytes(void) {
+    return g.reserve_mb << 20;
+}
+
 // ---- registration ----------------------------------------------------------------------
 
 void ggml_moe_cache_register(void) {
@@ -2345,7 +2351,10 @@ void ggml_moe_cache_register(void) {
     if (const char * e = getenv("GGML_CUDA_MOE_CACHE_WORKERS"))   { int n = atoi(e); if (n > 0 && n <= 16) g.n_workers = n; }
     if (const char * e = getenv("GGML_CUDA_MOE_CACHE_STATS"))     g.stats_every = atoi(e);
     if (const char * e = getenv("GGML_CUDA_MOE_CACHE_MIN_EXPERT_KB")) g.min_expert_bytes = (size_t)atoll(e) << 10;
-    if (const char * e = getenv("GGML_CUDA_MOE_CACHE_RESERVE_MB"))    g.reserve_mb = (size_t)atoll(e);
+    if (const char * e = getenv("GGML_CUDA_MOE_CACHE_RESERVE_MB")) {
+        long long v = atoll(e);
+        if (v > 0) g.reserve_mb = (size_t)v;
+    }
     if (const char * e = getenv("GGML_CUDA_MOE_CACHE_REUSE"))         g.reuse = atoi(e) > 0;
     if (const char * e = getenv("GGML_CUDA_MOE_CACHE_FUSE"))          g.fuse = atoi(e) > 0;
     if (const char * e = getenv("GGML_CUDA_MOE_CACHE_MAX_BATCH"))     { int n = atoi(e); if (n >= 1 && n <= 8) g.max_batch = n; }
@@ -2380,6 +2389,7 @@ void ggml_moe_cache_register(void) {
     ggml_moe_cache.tail_seed_record  = moe_cache_tail_seed_record;
     ggml_moe_cache.set_vram_slab     = moe_cache_set_vram_slab;
     ggml_moe_cache.set_prefill       = moe_cache_set_prefill;
+    ggml_moe_cache.reserve_bytes     = moe_cache_reserve_bytes;
     if (const char * e = getenv("GGML_CUDA_MOE_CACHE_REDIRECT")) g.redirect_on = atoi(e) > 0;
 
     MOE_CACHE_LOG("[moe-cache] enabled: n_dev=%d budget=%s inserts/plan=%d workers=%d stats_every=%d\n",

@@ -99,6 +99,11 @@ struct ggml_moe_cache_api {
     // When in_prefill is true: drains insert queue, waits out in-flight copies, pauses workers.
     // When false: flushes slab-backed pools, enqueues tail seeds, resumes workers.
     void (*set_prefill)(bool in_prefill);
+
+    // Bytes of free VRAM to leave untouched per device (parsed once from
+    // GGML_CUDA_MOE_CACHE_RESERVE_MB, default 512 MB). llama-context uses it
+    // as the safety margin when expanding the compute buffer for slab carving.
+    size_t (*reserve_bytes)(void);
 };
 
 // Zero-initialized in ggml-backend.cpp; populated by the CUDA backend in

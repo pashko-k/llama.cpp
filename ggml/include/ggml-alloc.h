@@ -73,6 +73,10 @@ GGML_API bool ggml_gallocr_alloc_graph(ggml_gallocr_t galloc, struct ggml_cgraph
 
 GGML_API size_t ggml_gallocr_get_buffer_size(ggml_gallocr_t galloc, int buffer_id);
 GGML_API ggml_backend_buffer_t ggml_gallocr_get_buffer_chunk(ggml_gallocr_t galloc, int buffer_id, int chunk_id);
+// reallocates a chunk at a larger size; the old contents are lost, so this is only valid for
+// COMPUTE buffers with no tensors bound (e.g. between graph reserves). returns false (chunk
+// restored or, if even the original size fails, the allocator is left broken) on OOM
+GGML_API bool ggml_gallocr_expand_buffer_chunk(ggml_gallocr_t galloc, int buffer_id, int chunk_id, size_t new_size);
 
 // returns the memory required by graph tensors in the buffer chunk (without any extra margin)
 GGML_API size_t ggml_gallocr_get_graph_size(ggml_gallocr_t galloc, int buffer_id);

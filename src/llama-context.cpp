@@ -613,6 +613,38 @@ static int llama_graph_n_input_tensors(ggml_cgraph * gf) {
     return (int) users.size();
 }
 
+// MoE cache: greedily expand the monolithic compute buffer chunk to absorb the device's idle
+// VRAM (minus the cache's reserve margin), then carve the tail past the decode-graph reserve
+// into the cache's slab. returns the final chunk size, 0 if this backend has no usable slab
+static size_t moe_cache_setup_slab(ggml_gallocr_t galloc, int backend_id, ggml_backend_dev_t dev,
+        size_t tg_need, size_t & tg_reserve_out, void * & base_out) {
+    ggml_backend_buffer_t chunk0 = ggml_gallocr_get_buffer_chunk(galloc, backend_id, 0);
+    if (!chunk0 || ggml_gallocr_get_buffer_chunk(galloc, backend_id, 1)) {
+        return 0;
+    }
+    size_t bsize = ggml_backend_buffer_get_size(chunk0);
+    size_t free_mem = 0, total_mem = 0;
+    ggml_backend_dev_memory(dev, &free_mem, &total_mem);
+    const size_t margin = ggml_moe_cache.reserve_bytes ? ggml_moe_cache.reserve_bytes() : (512ull << 20);
+    if (free_mem > margin && ggml_gallocr_expand_buffer_chunk(galloc, backend_id, 0, bsize + (free_mem - margin))) {
+        chunk0 = ggml_gallocr_get_buffer_chunk(galloc, backend_id, 0);
+        LLAMA_LOG_INFO("%s: dev %s compute buffer expanded by %.2f MiB to %.2f MiB (free was %.2f MiB)\n",
+                __func__, ggml_backend_dev_name(dev),
+                (free_mem - margin) / 1024.0 / 1024.0, ggml_backend_buffer_get_size(chunk0) / 1024.0 / 1024.0,
+                free_mem / 1024.0 / 1024.0);
+    }
+    bsize = ggml_backend_buffer_get_size(chunk0);
+    const size_t tg_reserve = std::max((size_t)(64 * 1024 * 1024),
+            (size_t)GGML_PAD(tg_need * 2, 2 * 1024 * 1024));
+    if (bsize <= tg_reserve) {
+        return 0;
+    }
+    base_out       = ggml_backend_buffer_get_base(chunk0);
+    tg_reserve_out = tg_reserve;
+    ggml_moe_cache.set_vram_slab((char *) base_out + tg_reserve, bsize - tg_reserve);
+    return bsize;
+}
+
 void llama_context::sched_reserve() {
     if (!sched_need_reserve) {
         return;
@@ -758,22 +790,13 @@ void llama_context::sched_reserve() {
             ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
             if (dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
                 ggml_gallocr_t galloc = ggml_backend_sched_get_gallocr(sched.get());
-                if (galloc) {
-                    ggml_backend_buffer_t chunk0 = ggml_gallocr_get_buffer_chunk(galloc, (int) i, 0);
-                    if (chunk0 && !ggml_gallocr_get_buffer_chunk(galloc, (int) i, 1)) {
-                        const size_t bsize = ggml_backend_buffer_get_size(chunk0);
-                        const size_t tg_need = tg_graph_sizes[i];
-                        const size_t tg_reserve = std::max((size_t)(64 * 1024 * 1024),
-                                (size_t)GGML_PAD(tg_need * 2, 2 * 1024 * 1024));
-                        if (bsize > tg_reserve) {
-                            const size_t slab_size = bsize - tg_reserve;
-                            void * base = ggml_backend_buffer_get_base(chunk0);
-                            void * slab_base = (char *) base + tg_reserve;
-                            moe_cache_tg_reserves[i] = tg_reserve;
-                            moe_cache_tg_bases[i]    = base;
-                            ggml_moe_cache.set_vram_slab(slab_base, slab_size);
-                        }
-                    }
+                size_t tg_reserve = 0;
+                void * base = nullptr;
+                const size_t bsize = galloc ? moe_cache_setup_slab(galloc, (int) i, dev, tg_graph_sizes[i], tg_reserve, base) : 0;
+                if (base) {
+                    backend_buf_exp_size[i] = bsize;
+                    moe_cache_tg_reserves[i] = tg_reserve;
+                    moe_cache_tg_bases[i]    = base;
                 }
             }
         }
