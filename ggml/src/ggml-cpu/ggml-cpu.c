@@ -1718,14 +1718,7 @@ static void ggml_compute_forward_mul_mat_id(
                     moe_cache_acts[moe_cache_n_hits]    = (const float *) ((const char *) src1->data + i11*nb11 + iid1*nb12);
                     moe_cache_rows[moe_cache_n_hits]    = (float *) ((char *) dst->data + iid1*nb2 + id*nb1);
                     moe_cache_n_hits++;
-                    static int shadow_cpu = -1;
-                    if (shadow_cpu < 0) {
-                        const char * s = getenv("GGML_CUDA_MOE_CACHE_SHADOW");
-                        shadow_cpu = s ? atoi(s) : 0;
-                    }
-                    if (!shadow_cpu) {
-                        continue;
-                    }
+                    continue;
                 }
 
                 MMID_MATRIX_ROW(i02, matrix_row_counts[i02]) = (struct mmid_row_mapping) {id, iid1};

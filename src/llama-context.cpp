@@ -1432,14 +1432,14 @@ bool llama_context::set_adapter_cvec(
 }
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
-    if (ggml_moe_cache.set_prefill) {
-        ggml_moe_cache.set_prefill(ubatch.n_tokens > 8);
-    }
-
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
         return nullptr;
+    }
+
+    if (ggml_moe_cache.set_prefill) {
+        ggml_moe_cache.set_prefill(ubatch.n_tokens > 8);
     }
 
     auto * res = get_gf_res_prev();
@@ -1500,9 +1500,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                         char * ptr = (char *) node->data;
                         if (ptr >= base && ptr < base + bsize) {
                             size_t off = (ptr - base) + ggml_nbytes(node);
-                            if (off > max_off) {
-                                max_off = off;
-                            }
+                            if (off > max_off) max_off = off;
                         }
                     }
                 }
@@ -1514,17 +1512,17 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                 if (galloc && ggml_moe_cache.set_vram_slab && chunk0) {
                     void * cur_base = ggml_backend_buffer_get_base(chunk0);
                     if (cur_base != moe_cache_tg_bases[i]) {
-                            const size_t bsize = ggml_backend_buffer_get_size(chunk0);
-                            if (bsize > moe_cache_tg_reserves[i]) {
-                                const size_t slab_size = bsize - moe_cache_tg_reserves[i];
-                                void * slab_base = (char *) cur_base + moe_cache_tg_reserves[i];
-                                moe_cache_tg_bases[i] = cur_base;
-                                ggml_moe_cache.set_vram_slab(slab_base, slab_size);
-                            }
+                        const size_t bsize = ggml_backend_buffer_get_size(chunk0);
+                        if (bsize > moe_cache_tg_reserves[i]) {
+                            const size_t slab_size = bsize - moe_cache_tg_reserves[i];
+                            void * slab_base = (char *) cur_base + moe_cache_tg_reserves[i];
+                            moe_cache_tg_bases[i] = cur_base;
+                            ggml_moe_cache.set_vram_slab(slab_base, slab_size);
                         }
                     }
                 }
             }
+        }
 
         gf_res_prev_active = res;
     }

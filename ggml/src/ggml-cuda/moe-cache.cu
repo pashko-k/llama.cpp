@@ -535,18 +535,6 @@ static void moe_cache_worker_main(int wid) {
             }
         }
 
-        if (err == cudaSuccess) {
-            char vbuf[64] = {};
-            cudaMemcpy(vbuf, dst, 64, cudaMemcpyDeviceToHost);
-            if (memcmp(vbuf, job.src, 64) != 0) {
-                static int bad_cp = 0;
-                if (bad_cp++ < 10) {
-                    fprintf(stderr, "[moe-cache-bad-copy] dev=%d blk=%d eid=%d si=%d dst=%p src=%p\n",
-                            job.dev, job.blk, job.eid, job.slot_idx, (void *)dst, job.src);
-                }
-            }
-        }
-
         {
             std::lock_guard<std::mutex> lk(g.mu);
             g.inflight_src[wid] = nullptr;
@@ -1238,14 +1226,6 @@ static int moe_cache_begin(const char * name, const void * host_base, size_t exp
         return -1;
     }
 
-    if (g.tail_seed_pending && g.tail_seed_enabled) {
-        std::lock_guard<std::mutex> lk(g.mu);
-        if (moe_cache_enqueue_tail_seed()) {
-            g.tail_seed_pending = false;
-            memset(g.tail_seed, 0, sizeof(g.tail_seed));
-        }
-    }
-
     // bail-out phases (decode visits on a working pool only)
     if (g.bail.enabled && !g.bail.tripped) {
         const long long vis = g.bail.eligible_seen++;
@@ -1800,7 +1780,7 @@ static void moe_cache_collect(int di, int n_hits, float * const * dst_rows, int6
         const char * s = getenv("GGML_CUDA_MOE_CACHE_SHADOW");
         shadow_mode = s ? atoi(s) : 0;
     }
-    if (cok) {
+    if (shadow_mode && cok) {
         static int n_logged = 0;
         for (int i = 0; i < n_hits; i++) {
             const float * gpu_row = d.h_out + (size_t)i * n_out;
@@ -1877,11 +1857,9 @@ static void moe_cache_collect(int di, int n_hits, float * const * dst_rows, int6
             }
         }
     }
-    if (!shadow_mode) {
-        for (int i = 0; i < n_hits; i++) {
-            if (cok) memcpy(dst_rows[i], d.h_out + (size_t)i * n_out, n_out * sizeof(float));
-            else     memset(dst_rows[i], 0, n_out * sizeof(float));
-        }
+    for (int i = 0; i < n_hits; i++) {
+        if (cok) memcpy(dst_rows[i], d.h_out + (size_t)i * n_out, n_out * sizeof(float));
+        else     memset(dst_rows[i], 0, n_out * sizeof(float));
     }
     d.out_rows   = 0;
     d.q8_act_ptr = nullptr;
