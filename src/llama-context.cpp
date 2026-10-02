@@ -785,8 +785,9 @@ void llama_context::sched_reserve() {
                     backend_buf_exp_size[i] / 1024.0 / 1024.0);
         }
 
-        // MoE cache: alias the idle tail of the monolithic compute buffer during decode
-        if (ggml_moe_cache.set_vram_slab && !ggml_backend_buft_is_host(buft)) {
+        // MoE cache: only the primary target context aliases the compute buffer tail (draft contexts must not overwrite the slab)
+        const bool is_primary_ctx = cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT && cparams.ctx_other == nullptr;
+        if (is_primary_ctx && ggml_moe_cache.set_vram_slab && !ggml_backend_buft_is_host(buft)) {
             ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
             if (dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
                 ggml_gallocr_t galloc = ggml_backend_sched_get_gallocr(sched.get());
@@ -1461,7 +1462,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         return nullptr;
     }
 
-    if (ggml_moe_cache.set_prefill) {
+    const bool is_primary_ctx = cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT && cparams.ctx_other == nullptr;
+
+    if (is_primary_ctx && ggml_moe_cache.set_prefill) {
         ggml_moe_cache.set_prefill(ubatch.n_tokens > 8);
     }
 
@@ -1508,39 +1511,41 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             return nullptr;
         }
 
-        // MoE cache invariant checks
-        for (size_t i = 0; i < backend_ptrs.size(); ++i) {
-            if (i < moe_cache_tg_reserves.size() && moe_cache_tg_reserves[i] > 0) {
-                ggml_gallocr_t galloc = ggml_backend_sched_get_gallocr(sched.get());
-                ggml_backend_buffer_t chunk0 = galloc ? ggml_gallocr_get_buffer_chunk(galloc, (int) i, 0) : nullptr;
-                size_t max_off = 0;
-                if (chunk0) {
-                    char * base = (char *) ggml_backend_buffer_get_base(chunk0);
-                    size_t bsize = ggml_backend_buffer_get_size(chunk0);
-                    const int n_nodes = ggml_graph_n_nodes(gf);
-                    for (int n = 0; n < n_nodes; ++n) {
-                        struct ggml_tensor * node = ggml_graph_node(gf, n);
-                        char * ptr = (char *) node->data;
-                        if (ptr >= base && ptr < base + bsize) {
-                            size_t off = (ptr - base) + ggml_nbytes(node);
-                            if (off > max_off) max_off = off;
+        // MoE cache invariant checks: primary target context only (draft contexts do not manage the cache slab)
+        if (is_primary_ctx) {
+            for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+                if (i < moe_cache_tg_reserves.size() && moe_cache_tg_reserves[i] > 0) {
+                    ggml_gallocr_t galloc = ggml_backend_sched_get_gallocr(sched.get());
+                    ggml_backend_buffer_t chunk0 = galloc ? ggml_gallocr_get_buffer_chunk(galloc, (int) i, 0) : nullptr;
+                    size_t max_off = 0;
+                    if (chunk0) {
+                        char * base = (char *) ggml_backend_buffer_get_base(chunk0);
+                        size_t bsize = ggml_backend_buffer_get_size(chunk0);
+                        const int n_nodes = ggml_graph_n_nodes(gf);
+                        for (int n = 0; n < n_nodes; ++n) {
+                            struct ggml_tensor * node = ggml_graph_node(gf, n);
+                            char * ptr = (char *) node->data;
+                            if (ptr >= base && ptr < base + bsize) {
+                                size_t off = (ptr - base) + ggml_nbytes(node);
+                                if (off > max_off) max_off = off;
+                            }
                         }
                     }
-                }
-                if (ubatch.n_tokens <= 8) {
-                    GGML_ASSERT(max_off <= moe_cache_tg_reserves[i] && "MoE cache slab overrun: decode graph exceeded tg_reserve");
-                }
+                    if (ubatch.n_tokens <= 8) {
+                        GGML_ASSERT(max_off <= moe_cache_tg_reserves[i] && "MoE cache slab overrun: decode graph exceeded tg_reserve");
+                    }
 
-                // check if the compute buffer base moved due to reallocation
-                if (galloc && ggml_moe_cache.set_vram_slab && chunk0) {
-                    void * cur_base = ggml_backend_buffer_get_base(chunk0);
-                    if (cur_base != moe_cache_tg_bases[i]) {
-                        const size_t bsize = ggml_backend_buffer_get_size(chunk0);
-                        if (bsize > moe_cache_tg_reserves[i]) {
-                            const size_t slab_size = bsize - moe_cache_tg_reserves[i];
-                            void * slab_base = (char *) cur_base + moe_cache_tg_reserves[i];
-                            moe_cache_tg_bases[i] = cur_base;
-                            ggml_moe_cache.set_vram_slab(slab_base, slab_size);
+                    // check if the compute buffer base moved due to reallocation
+                    if (galloc && ggml_moe_cache.set_vram_slab && chunk0) {
+                        void * cur_base = ggml_backend_buffer_get_base(chunk0);
+                        if (cur_base != moe_cache_tg_bases[i]) {
+                            const size_t bsize = ggml_backend_buffer_get_size(chunk0);
+                            if (bsize > moe_cache_tg_reserves[i]) {
+                                const size_t slab_size = bsize - moe_cache_tg_reserves[i];
+                                void * slab_base = (char *) cur_base + moe_cache_tg_reserves[i];
+                                moe_cache_tg_bases[i] = cur_base;
+                                ggml_moe_cache.set_vram_slab(slab_base, slab_size);
+                            }
                         }
                     }
                 }
