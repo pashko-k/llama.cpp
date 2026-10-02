@@ -18,6 +18,8 @@
 //
 // Keys are FNV-1a hashes of the weight tensor's name (stable across contexts
 // and mmap remaps) mixed with the expert id.
+//
+// Configuration (environment variables): see README-moe-cache.md.
 
 #include "moe-cache.cuh"
 #include "common.cuh"
