@@ -121,6 +121,11 @@ llama_context::llama_context(
     cparams.embeddings_nextn_masked = false;
     cparams.offload_kqv             = params.offload_kqv;
     cparams.no_perf                 = params.no_perf;
+
+    // the MoE cache logs its compact stats when the host tracks perf timings
+    if (!cparams.no_perf && ggml_moe_cache.set_perf) {
+        ggml_moe_cache.set_perf(true);
+    }
     cparams.warmup                  = false;
 
     // +1: id n_layer() taps the output of the last layer ("input" of the head)
@@ -1481,8 +1486,13 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
     const bool is_primary_ctx = is_moe_cache_primary();
 
-    if (is_primary_ctx && ggml_moe_cache.set_prefill) {
-        ggml_moe_cache.set_prefill(ubatch.n_tokens > 8);
+    if (is_primary_ctx) {
+        if (ggml_moe_cache.set_prefill) {
+            ggml_moe_cache.set_prefill(ubatch.n_tokens > 8);
+        }
+        if (ggml_moe_cache.stats_tick) {
+            ggml_moe_cache.stats_tick(ubatch.n_tokens);
+        }
     }
 
     auto * res = get_gf_res_prev();

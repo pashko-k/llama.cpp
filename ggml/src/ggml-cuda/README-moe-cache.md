@@ -44,8 +44,7 @@ as lazily read on first use) and apply per process.
 | `GGML_CUDA_MOE_CACHE_INSERTS` | 8 | Max async insert jobs enqueued per `plan()` call. |
 | `GGML_CUDA_MOE_CACHE_THROTTLE` | 8 | When pools are full, admit only 1-in-N misses for insertion. |
 | `GGML_CUDA_MOE_CACHE_WORKERS` | 4 | Insert worker thread count. Range 1..16. |
-| `GGML_CUDA_MOE_CACHE_FREQ_FILTER` | 1 | Frequency-based admission filter. `0` admits every miss. |
-| `GGML_CUDA_MOE_CACHE_MIN_FREQ` | 2 | Admit an expert only after it is seen this many decode times. |
+| `GGML_CUDA_MOE_CACHE_MIN_FREQ` | 2 | Admit an expert only after it is seen this many decode times. `0` disables the frequency filter (admits every miss). |
 | `GGML_CUDA_MOE_CACHE_DECAY_TOKENS` | 512 | Halve all frequency counters every N decode tokens. |
 
 ## Warm start and phase transitions
@@ -84,8 +83,12 @@ These read the environment lazily (on first use), not at registration.
 
 | Variable | Default | Description |
 | :-- | :-- | :-- |
-| `GGML_CUDA_MOE_CACHE_STATS` | 0 (off) | Log hit/miss/insert stats every N `collect()` calls. |
-| `GGML_CUDA_MOE_CACHE_DEBUG` | 0 (off) | Trace the first API calls to locate stalls. `>= 10` traces that many lines instead of the default 400. |
+| `GGML_CUDA_MOE_CACHE_STATS` | 0 (off) | Log the full extended stats dump every N processed tokens. |
+| `GGML_CUDA_MOE_CACHE_DEBUG` | 0 (off) | Trace the first API calls to locate stalls. `>= 10` traces that many lines instead of the default 400. Also logs the extended dump at every generation-to-prefill transition. |
 | `GGML_CUDA_MOE_CACHE_DEBUG_GATE` | 0 (off) | Log up to N `begin()` gate decisions: why a node engages or stays CPU. |
 | `GGML_CUDA_MOE_CACHE_SHADOW` | 0 (off) | Verification mode: compute hits on both CPU and GPU, compare rows, log divergence. Slows the hot path; diagnostics only. |
 | `GGML_CUDA_MOE_CACHE_SELFTEST` | 0 (off) | Run the kernel self-test at registration (needs a GPU). |
+
+With perf timing enabled (llama-server `--perf`, on by default) the cache logs one
+compact line per device at every generation-to-prefill transition: the hit ratio
+since the previous print, slot occupancy, and a global bail-timing line.

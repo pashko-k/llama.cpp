@@ -129,6 +129,7 @@ struct moe_cache_device {
     // stats
     long long hits = 0, misses = 0, inserts = 0, evictions = 0;
     long long insert_skips = 0, queued_misses = 0;
+    long long w_prev_hits = 0, w_prev_tot = 0; // compact-stats window snapshot
     // miss decomposition (counters only, no behavior change)
     long long pool_hits[MOE_CACHE_MAX_POOLS] = {}, pool_miss[MOE_CACHE_MAX_POOLS] = {};
     long long miss_compulsory = 0, miss_capacity = 0, miss_admission = 0;
@@ -157,7 +158,7 @@ struct moe_cache_freq_tracker {
     int64_t decode_tokens    = 0;
     int     decay_tokens     = 512;
     int     min_admit_freq   = 2;
-    bool    enabled          = true;
+    bool    enabled          = true; // GGML_CUDA_MOE_CACHE_MIN_FREQ=0 to disable
 };
 
 struct moe_cache_global {
@@ -177,7 +178,9 @@ struct moe_cache_global {
     size_t min_expert_bytes = 256u << 10; // default 256 KB floor (accommodates 450-850 KB experts)
     int    max_batch        = 8; // decode batches up to this size use the cache
                                  // (GGML_CUDA_MOE_CACHE_MAX_BATCH; >1 for spec-verify/parallel)
-    int    stats_every      = 0; // log every N collect() calls (0 = off)
+    long long stats_tokens  = 0; // extended stats every N processed tokens (0 = off)
+    long long stats_tok_acc = 0;
+    bool   perf             = false; // set_perf(): host perf timing on -> compact stats at prefill
 
     moe_cache_freq_tracker freq;
     int    decay_blk = -1;              // dynamically learned lowest engaged gate layer for token decay
@@ -279,8 +282,6 @@ struct moe_cache_global {
     std::unordered_map<const void *, redirect_entry> redirect;
     bool redirect_on = true;       // GGML_CUDA_MOE_CACHE_REDIRECT=0 to disable
 
-    long long collect_calls = 0;
-
     // ---- baseline-sampled bail-out ----
     // Phase A (after pools build): eligible nodes run pure-CPU while their wall
     // time builds the baseline EWMA (begin returns -3 so the kernel reports the
@@ -312,9 +313,12 @@ static moe_cache_global & g = *new moe_cache_global();
 // GGML_CUDA_MOE_CACHE_DEBUG=1: trace the first calls of each API to locate stalls
 static int g_dbg = -1;
 static long long g_dbg_n = 0;
+static int moe_cache_dbg_level(void) {
+    if (g_dbg < 0) { const char * _e = getenv("GGML_CUDA_MOE_CACHE_DEBUG"); g_dbg = _e ? atoi(_e) : 0; }
+    return g_dbg;
+}
 #define MOE_CACHE_DBG(...) do { \
-        if (g_dbg < 0) { const char * _e = getenv("GGML_CUDA_MOE_CACHE_DEBUG"); g_dbg = _e ? atoi(_e) : 0; } \
-        if (g_dbg > 0 && g_dbg_n++ < (g_dbg >= 10 ? (long long)g_dbg : 400)) { MOE_CACHE_LOG(__VA_ARGS__); fflush(stderr); } \
+        if (moe_cache_dbg_level() > 0 && g_dbg_n++ < (g_dbg >= 10 ? (long long)g_dbg : 400)) { MOE_CACHE_LOG(__VA_ARGS__); fflush(stderr); } \
     } while (0)
 
 // checked CUDA call: on failure the device's cache is disabled (begin() will
@@ -863,10 +867,13 @@ static bool moe_cache_enqueue_tail_seed(void) {
     return true;
 }
 
+static void moe_cache_stats_gen_summary(void);
+
 static void moe_cache_set_prefill(bool in_prefill) {
     if (!g.enabled) return;
     if (in_prefill) {
         if (!g.in_prefill) {
+            moe_cache_stats_gen_summary(); // a generation phase just ended
             std::unique_lock<std::mutex> lk(g.mu);
             if (!g.in_prefill) {
                 g.in_prefill = true;
@@ -1634,8 +1641,6 @@ static void moe_cache_dispatch(int di, int wtype_int, int64_t n_in, int64_t n_ou
 
 // ---- API: collect --------------------------------------------------------------------
 
-static void moe_cache_stats(void);
-
 static void moe_cache_collect(int di, int n_hits, float * const * dst_rows, int64_t n_out) {
     const int64_t t0 = ggml_time_us();
     moe_cache_device & d = g.dev[di];
@@ -1699,7 +1704,6 @@ static void moe_cache_collect(int di, int n_hits, float * const * dst_rows, int6
                 d.q8_act_ptr = nullptr;
                 d.fused_layers++;
                 d.t_coll_us += ggml_time_us() - t0;
-                if (g.stats_every > 0 && ++g.collect_calls % g.stats_every == 0) moe_cache_stats();
                 return;
             }
             if (g.cur_role == 1) {
@@ -1771,7 +1775,6 @@ static void moe_cache_collect(int di, int n_hits, float * const * dst_rows, int6
             re->par       = par;
             d.out_rows = 0;
             d.t_coll_us += ggml_time_us() - t0;
-            if (g.stats_every > 0 && ++g.collect_calls % g.stats_every == 0) moe_cache_stats();
             return;
         }
     }
@@ -1870,10 +1873,6 @@ static void moe_cache_collect(int di, int n_hits, float * const * dst_rows, int6
     d.out_rows   = 0;
     d.q8_act_ptr = nullptr;
     d.t_coll_us += ggml_time_us() - t0;
-
-    if (g.stats_every > 0 && ++g.collect_calls % g.stats_every == 0) {
-        moe_cache_stats();
-    }
 }
 
 // ---- API: GPU-resident dst handoff ----------------------------------------------------
@@ -2142,7 +2141,7 @@ static void moe_cache_invalidate(const void * base, size_t size) {
 // ---- API: node wall-time samples (bail-out) ---------------------------------------------
 
 static void moe_cache_node_time(int code, int64_t us) {
-    if (!g.bail.enabled || g.bail.tripped) return;
+    if (g.bail.tripped) return;
     auto & b = g.bail;
     const int64_t n_tok = g.cur_n_tokens > 0 ? g.cur_n_tokens : 1;
     const double per_tok_us = (double)us / n_tok;
@@ -2154,6 +2153,7 @@ static void moe_cache_node_time(int code, int64_t us) {
     if (code < 0) return;
     b.on_ewma = b.on_n == 0 ? per_tok_us : b.on_ewma + (per_tok_us - b.on_ewma) / 256.0;
     b.on_n++;
+    if (!b.enabled) return; // EWMA is informational; only the verdict needs bail enabled
     if (b.base_n < 1000 || b.on_n < b.min_on_samples) return;
     if (b.on_n % 256 != 0) return;
     if (b.on_ewma > b.base_ewma * b.threshold_ratio) {
@@ -2174,7 +2174,7 @@ static void moe_cache_node_time(int code, int64_t us) {
 
 // ---- API: stats ----------------------------------------------------------------------
 
-static void moe_cache_stats(void) {
+static void moe_cache_stats_extended(void) {
     for (int i = 0; i < g.n_dev; i++) {
         moe_cache_device & d = g.dev[i];
         if (!d.compute_stream) continue;
@@ -2212,6 +2212,76 @@ static void moe_cache_stats(void) {
             }
         }
     }
+}
+
+// compact output: one line per device (hit ratio since the previous print)
+// plus the global bail timing line
+static void moe_cache_stats_compact(void) {
+    for (int i = 0; i < g.n_dev; i++) {
+        moe_cache_device & d = g.dev[i];
+        if (!d.compute_stream) continue;
+        const long long tot = d.hits + d.misses;
+        const long long w_tot = tot - d.w_prev_tot, w_hit = d.hits - d.w_prev_hits;
+        int used = 0, slots = 0;
+        for (int pi = 0; pi < d.n_pools; pi++) { used += d.pools[pi].n_used; slots += d.pools[pi].n_slots; }
+        MOE_CACHE_LOG("[moe-cache] dev=%d hit=%.1f%% (%lld/%lld) lifetime=%.1f%% used=%d/%d\n",
+                i, w_tot ? 100.0 * w_hit / w_tot : 0.0, w_hit, w_tot,
+                tot ? 100.0 * d.hits / tot : 0.0, used, slots);
+    }
+    if (g.bail.base_n > 0 || g.bail.on_n > 0) {
+        MOE_CACHE_LOG("[moe-cache] bail: base=%.1fus(n=%lld) on=%.1fus(n=%lld) strikes=%d/%d enabled=%d\n",
+                g.bail.base_ewma, g.bail.base_n, g.bail.on_ewma, g.bail.on_n,
+                g.bail.strikes, g.bail.max_strikes, (int) g.bail.enabled);
+    }
+    fflush(stderr);
+}
+
+static void moe_cache_stats_snapshot(void) {
+    for (int i = 0; i < g.n_dev; i++) {
+        moe_cache_device & d = g.dev[i];
+        d.w_prev_hits = d.hits;
+        d.w_prev_tot  = d.hits + d.misses;
+    }
+}
+
+// called on the generation->prefill edge: a generation phase just ended
+static void moe_cache_stats_gen_summary(void) {
+    const bool dbg = moe_cache_dbg_level() > 0;
+    if (!g.perf && !dbg) {
+        return;
+    }
+    long long w_all = 0;
+    for (int i = 0; i < g.n_dev; i++) {
+        moe_cache_device & d = g.dev[i];
+        if (!d.compute_stream) continue;
+        w_all += (d.hits + d.misses) - d.w_prev_tot;
+    }
+    if (w_all == 0 && !dbg) {
+        return; // no cache activity since the previous print
+    }
+    if (dbg) {
+        moe_cache_stats_extended();
+    } else {
+        moe_cache_stats_compact();
+    }
+    moe_cache_stats_snapshot();
+}
+
+static void moe_cache_stats_tick(int64_t n_tokens) {
+    if (!g.enabled || g.stats_tokens <= 0 || n_tokens <= 0) {
+        return;
+    }
+    g.stats_tok_acc += n_tokens;
+    if (g.stats_tok_acc < g.stats_tokens) {
+        return;
+    }
+    g.stats_tok_acc = 0;
+    moe_cache_stats_extended();
+    moe_cache_stats_snapshot();
+}
+
+static void moe_cache_set_perf(bool on) {
+    g.perf = on;
 }
 
 // ---- self-test ---------------------------------------------------------------------------
@@ -2356,7 +2426,7 @@ void ggml_moe_cache_register(void) {
     if (const char * e = getenv("GGML_CUDA_MOE_CACHE_INSERTS"))   g.inserts_per_plan = atoi(e);
     if (const char * e = getenv("GGML_CUDA_MOE_CACHE_THROTTLE"))  { g.throttle_mod = atoi(e); if (g.throttle_mod < 1) g.throttle_mod = 1; }
     if (const char * e = getenv("GGML_CUDA_MOE_CACHE_WORKERS"))   { int n = atoi(e); if (n > 0 && n <= 16) g.n_workers = n; }
-    if (const char * e = getenv("GGML_CUDA_MOE_CACHE_STATS"))     g.stats_every = atoi(e);
+    if (const char * e = getenv("GGML_CUDA_MOE_CACHE_STATS"))     { g.stats_tokens = atoll(e); if (g.stats_tokens < 0) g.stats_tokens = 0; }
     if (const char * e = getenv("GGML_CUDA_MOE_CACHE_MIN_EXPERT_KB")) g.min_expert_bytes = (size_t)atoll(e) << 10;
     if (const char * e = getenv("GGML_CUDA_MOE_CACHE_RESERVE_MB")) {
         std::string s(e);
@@ -2382,8 +2452,7 @@ void ggml_moe_cache_register(void) {
     if (const char * e = getenv("GGML_CUDA_MOE_CACHE_PREFETCH"))            g.backfill.enabled = atoi(e) > 0;
     if (const char * e = getenv("GGML_CUDA_MOE_CACHE_HOTSET"))              g.hotset_enabled = atoi(e) > 0;
     if (const char * e = getenv("GGML_CUDA_MOE_CACHE_TAIL_SEED"))           g.tail_seed_enabled = atoi(e) > 0;
-    if (const char * e = getenv("GGML_CUDA_MOE_CACHE_FREQ_FILTER"))         g.freq.enabled = atoi(e) > 0;
-    if (const char * e = getenv("GGML_CUDA_MOE_CACHE_MIN_FREQ"))            { int n = atoi(e); if (n >= 1) g.freq.min_admit_freq = n; }
+    if (const char * e = getenv("GGML_CUDA_MOE_CACHE_MIN_FREQ"))            { int n = atoi(e); if (n >= 0) { g.freq.min_admit_freq = n; g.freq.enabled = n > 0; } }
     if (const char * e = getenv("GGML_CUDA_MOE_CACHE_DECAY_TOKENS"))        { int n = atoi(e); if (n >= 1) g.freq.decay_tokens = n; }
     if (const char * e = getenv("GGML_CUDA_MOE_CACHE_SEQUENTIAL_BACKFILL")) g.sequential_backfill = atoi(e) > 0;
     if (const char * e = getenv("GGML_CUDA_MOE_CACHE_MTP_BLK"))             { int n = atoi(e); if (n >= 0) g.mtp_blk = n; }
@@ -2401,7 +2470,7 @@ void ggml_moe_cache_register(void) {
     ggml_moe_cache.plan     = moe_cache_plan;
     ggml_moe_cache.dispatch = moe_cache_dispatch;
     ggml_moe_cache.collect  = moe_cache_collect;
-    ggml_moe_cache.stats    = moe_cache_stats;
+    ggml_moe_cache.stats    = moe_cache_stats_extended;
     ggml_moe_cache.redirect_offer    = moe_cache_redirect_offer;
     ggml_moe_cache.redirect_finalize = moe_cache_redirect_finalize;
     ggml_moe_cache.glu_hits          = moe_cache_glu_hits;
@@ -2411,11 +2480,13 @@ void ggml_moe_cache_register(void) {
     ggml_moe_cache.set_vram_slab     = moe_cache_set_vram_slab;
     ggml_moe_cache.set_prefill       = moe_cache_set_prefill;
     ggml_moe_cache.reserve_bytes     = moe_cache_reserve_bytes;
+    ggml_moe_cache.stats_tick        = moe_cache_stats_tick;
+    ggml_moe_cache.set_perf          = moe_cache_set_perf;
     if (const char * e = getenv("GGML_CUDA_MOE_CACHE_REDIRECT")) g.redirect_on = atoi(e) > 0;
 
-    MOE_CACHE_LOG("[moe-cache] enabled: n_dev=%d budget=%s inserts/plan=%d workers=%d stats_every=%d\n",
+    MOE_CACHE_LOG("[moe-cache] enabled: n_dev=%d budget=%s inserts/plan=%d workers=%d stats=%lld tok\n",
             g.n_dev, g.budget_mb ? "env" : "auto-70%-free", g.inserts_per_plan,
-            g.n_workers, g.stats_every);
+            g.n_workers, g.stats_tokens);
 
     if (const char * e = getenv("GGML_CUDA_MOE_CACHE_SELFTEST"); e && atoi(e) > 0) {
         moe_cache_selftest();

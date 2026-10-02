@@ -2,6 +2,7 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include <stdbool.h>
 
 // MoE expert cache — dynamic VRAM cache for MoE expert weights on CPU-resident
 // MUL_MAT_ID. Integration point is the CPU mul_mat_id kernel itself: thread 0
@@ -51,7 +52,7 @@ struct ggml_moe_cache_api {
     // (in dispatch order) into dst_rows[0..n_hits-1] (n_out floats each).
     void (*collect)(int dev, int n_hits, float * const * dst_rows, int64_t n_out);
 
-    // Periodic stats logging (rate-limited internally).
+    // Full extended stats dump on demand (stderr).
     void (*stats)(void);
 
     // ---- GPU-resident dst handoff (down-projection round-trip elimination) ----
@@ -104,6 +105,17 @@ struct ggml_moe_cache_api {
     // GGML_CUDA_MOE_CACHE_RESERVE_MB, default 512 MB). llama-context uses it
     // as the safety margin when expanding the compute buffer for slab carving.
     size_t (*reserve_bytes)(int dev);
+
+    // Advance the stats interval by the tokens of one processed ubatch (called
+    // by the primary context). Logs the full extended dump every
+    // GGML_CUDA_MOE_CACHE_STATS tokens (default 0 = off).
+    void (*stats_tick)(int64_t n_tokens);
+
+    // Tells the cache the host has perf timing enabled (llama --perf): at the
+    // generation-to-prefill transition the cache logs one compact line per
+    // device (hit ratio since the previous print) plus a global bail-timing
+    // line. With GGML_CUDA_MOE_CACHE_DEBUG the extended dump is logged there.
+    void (*set_perf)(bool on);
 };
 
 // Zero-initialized in ggml-backend.cpp; populated by the CUDA backend in
