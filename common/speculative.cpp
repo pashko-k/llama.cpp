@@ -2480,8 +2480,10 @@ common_params common_base_params_to_speculative(const common_params & params) {
     result.n_outputs_max = params.n_parallel;
     result.n_outputs_max_per_seq = 1;
 
-    // cap draft ubatch to prevent allocating gigabytes of idle scratchpad; decode() splits prefill catch-up automatically
-    result.n_ubatch = std::min(result.n_ubatch, 512);
+    // draft decode ubatch is at most n_parallel * (n_max + 1)
+    // cap draft ubatch to prevent allocating gigabytes of idle scratchpad during prefill catch-up
+    constexpr int32_t COMMON_SPEC_DRAFT_MAX_UBATCH = 512;
+    result.n_ubatch = std::min(result.n_ubatch, COMMON_SPEC_DRAFT_MAX_UBATCH);
 
     // dflash/dspark decode the whole noise block in a single pass and sample every block position on the backend
     // TODO: refactor such properties to be announced by the speculative types

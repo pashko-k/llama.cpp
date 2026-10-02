@@ -625,13 +625,23 @@ static size_t moe_cache_setup_slab(ggml_gallocr_t galloc, int backend_id, ggml_b
     size_t bsize = ggml_backend_buffer_get_size(chunk0);
     size_t free_mem = 0, total_mem = 0;
     ggml_backend_dev_memory(dev, &free_mem, &total_mem);
-    const size_t margin = ggml_moe_cache.reserve_bytes ? ggml_moe_cache.reserve_bytes() : (512ull << 20);
+    int dev_idx = 0;
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    if (reg) {
+        for (size_t d = 0; d < ggml_backend_reg_dev_count(reg); ++d) {
+            if (ggml_backend_reg_dev_get(reg, d) == dev) {
+                dev_idx = (int) d;
+                break;
+            }
+        }
+    }
+    const size_t margin = ggml_moe_cache.reserve_bytes ? ggml_moe_cache.reserve_bytes(dev_idx) : (512ull << 20);
     if (free_mem > margin && ggml_gallocr_expand_buffer_chunk(galloc, backend_id, 0, bsize + (free_mem - margin))) {
         chunk0 = ggml_gallocr_get_buffer_chunk(galloc, backend_id, 0);
-        LLAMA_LOG_INFO("%s: dev %s compute buffer expanded by %.2f MiB to %.2f MiB (free was %.2f MiB)\n",
+        LLAMA_LOG_INFO("%s: dev %s compute buffer expanded by %.2f MiB to %.2f MiB (free was %.2f MiB, reserve %.2f MiB)\n",
                 __func__, ggml_backend_dev_name(dev),
                 (free_mem - margin) / 1024.0 / 1024.0, ggml_backend_buffer_get_size(chunk0) / 1024.0 / 1024.0,
-                free_mem / 1024.0 / 1024.0);
+                free_mem / 1024.0 / 1024.0, margin / 1024.0 / 1024.0);
     }
     bsize = ggml_backend_buffer_get_size(chunk0);
     const size_t tg_reserve = std::max((size_t)(64 * 1024 * 1024),
@@ -643,6 +653,12 @@ static size_t moe_cache_setup_slab(ggml_gallocr_t galloc, int backend_id, ggml_b
     tg_reserve_out = tg_reserve;
     ggml_moe_cache.set_vram_slab((char *) base_out + tg_reserve, bsize - tg_reserve);
     return bsize;
+}
+
+bool llama_context::is_moe_cache_primary() const {
+    return !cparams.embeddings &&
+           cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT &&
+           cparams.ctx_other == nullptr;
 }
 
 void llama_context::sched_reserve() {
@@ -773,6 +789,9 @@ void llama_context::sched_reserve() {
     moe_cache_tg_reserves.assign(backend_ptrs.size(), 0);
     moe_cache_tg_bases.assign(backend_ptrs.size(), nullptr);
 
+    // MoE cache: only the primary target context aliases the compute buffer tail (draft contexts must not overwrite the slab)
+    const bool is_primary_ctx = is_moe_cache_primary();
+
     for (size_t i = 0; i < backend_ptrs.size(); ++i) {
         ggml_backend_t             backend = backend_ptrs[i];
         ggml_backend_buffer_type_t buft    = backend_buft[i];
@@ -785,8 +804,6 @@ void llama_context::sched_reserve() {
                     backend_buf_exp_size[i] / 1024.0 / 1024.0);
         }
 
-        // MoE cache: only the primary target context aliases the compute buffer tail (draft contexts must not overwrite the slab)
-        const bool is_primary_ctx = cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT && cparams.ctx_other == nullptr;
         if (is_primary_ctx && ggml_moe_cache.set_vram_slab && !ggml_backend_buft_is_host(buft)) {
             ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
             if (dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
@@ -1462,7 +1479,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         return nullptr;
     }
 
-    const bool is_primary_ctx = cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT && cparams.ctx_other == nullptr;
+    const bool is_primary_ctx = is_moe_cache_primary();
 
     if (is_primary_ctx && ggml_moe_cache.set_prefill) {
         ggml_moe_cache.set_prefill(ubatch.n_tokens > 8);

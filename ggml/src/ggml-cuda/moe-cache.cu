@@ -36,6 +36,7 @@
 #include <condition_variable>
 #include <deque>
 #include <mutex>
+#include <sstream>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
@@ -163,7 +164,8 @@ struct moe_cache_global {
     bool   enabled  = false;
     int    n_dev    = 0;
     size_t budget_mb = 0;        // 0 = auto (free VRAM at init minus reserve)
-    size_t reserve_mb = 512;     // VRAM left untouched per device: the CUDA pool
+    size_t reserve_mb[MOE_CACHE_MAX_DEV] = {512, 512, 512, 512, 512, 512, 512, 512};
+                                 // VRAM left untouched per device: the CUDA pool
                                  // grows lazily AFTER our init; stealing it
                                  // crashes the model mid-decode (measured).
                                  // Also the safety margin llama-context keeps when
@@ -1110,7 +1112,7 @@ static int moe_cache_begin(const char * name, const void * host_base, size_t exp
         // unallocated and starved the down pool (measured).
         auto & pend = g_disc.pending[di];
         if (!pend.empty()) {
-            const size_t reserve = g.reserve_mb << 20;
+            const size_t reserve = g.reserve_mb[di] << 20;
             size_t free_mem = 0, total_mem = 0;
             ggml_cuda_set_device(di);
             CUDA_CHECK(cudaMemGetInfo(&free_mem, &total_mem));
@@ -2323,8 +2325,11 @@ static void moe_cache_selftest(void) {
     MOE_CACHE_LOG("[moe-cache-selftest] %s\n", all ? "ALL PASS" : "FAILURES PRESENT");
 }
 
-static size_t moe_cache_reserve_bytes(void) {
-    return g.reserve_mb << 20;
+static size_t moe_cache_reserve_bytes(int dev) {
+    if (dev >= 0 && dev < MOE_CACHE_MAX_DEV) {
+        return g.reserve_mb[dev] << 20;
+    }
+    return g.reserve_mb[0] << 20;
 }
 
 // ---- registration ----------------------------------------------------------------------
@@ -2354,8 +2359,22 @@ void ggml_moe_cache_register(void) {
     if (const char * e = getenv("GGML_CUDA_MOE_CACHE_STATS"))     g.stats_every = atoi(e);
     if (const char * e = getenv("GGML_CUDA_MOE_CACHE_MIN_EXPERT_KB")) g.min_expert_bytes = (size_t)atoll(e) << 10;
     if (const char * e = getenv("GGML_CUDA_MOE_CACHE_RESERVE_MB")) {
-        long long v = atoll(e);
-        if (v > 0) g.reserve_mb = (size_t)v;
+        std::string s(e);
+        std::stringstream ss(s);
+        std::string token;
+        int idx = 0;
+        while (std::getline(ss, token, ',') && idx < MOE_CACHE_MAX_DEV) {
+            long long val = atoll(token.c_str());
+            if (val >= 0) {
+                g.reserve_mb[idx] = (size_t)val;
+            }
+            idx++;
+        }
+        if (idx == 1) {
+            for (int i = 1; i < MOE_CACHE_MAX_DEV; i++) {
+                g.reserve_mb[i] = g.reserve_mb[0];
+            }
+        }
     }
     if (const char * e = getenv("GGML_CUDA_MOE_CACHE_REUSE"))         g.reuse = atoi(e) > 0;
     if (const char * e = getenv("GGML_CUDA_MOE_CACHE_FUSE"))          g.fuse = atoi(e) > 0;

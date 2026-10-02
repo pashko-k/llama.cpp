@@ -27,7 +27,7 @@ as lazily read on first use) and apply per process.
 | :-- | :-- | :-- |
 | `GGML_CUDA_MOE_CACHE_NDEV` | all GPUs | Limit the cache to the first N CUDA devices. |
 | `GGML_CUDA_MOE_CACHE_BUDGET_MB` | 0 (auto) | Cap the total cache size per device. 0 = auto: free VRAM at init minus the reserve, or the slab size when a compute-buffer tail slab was carved. |
-| `GGML_CUDA_MOE_CACHE_RESERVE_MB` | 512 | Free VRAM to leave untouched per device. Also the safety margin llama-context keeps when expanding the compute buffer before slab carving. Lowering it too far lets the lazily growing CUDA pool starve mid-decode and crash the process. |
+| `GGML_CUDA_MOE_CACHE_RESERVE_MB` | 512 | Free VRAM to leave untouched per device (comma-separated list for per-device values, e.g. `3200,512`, or single value for all devices). Also the safety margin llama-context keeps when expanding the compute buffer before slab carving. Lowering it too far lets the lazily growing CUDA pool starve mid-decode and crash the process. |
 | `GGML_CUDA_MOE_CACHE_MIN_EXPERT_KB` | 256 | Experts smaller than this (KB) are never cached; too small to amortize the dispatch cost. |
 
 ## Cache engagement
