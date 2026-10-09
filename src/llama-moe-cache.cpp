@@ -487,7 +487,7 @@ struct llama_moe_cache::impl {
             }
         }
         if (groups.empty()) {
-            LLAMA_LOG_WARN("%s: no layer has all of its experts in host memory, MoE cache is disabled\n", __func__);
+            LLAMA_LOG_DEBUG("%s: no layer on device %s has all experts in host memory\n", __func__, ggml_backend_name(backend));
             return;
         }
 
@@ -740,6 +740,14 @@ struct llama_moe_cache::impl {
         }
     }
 
+    bool empty() const {
+        return groups.empty() || ctx == nullptr;
+    }
+
+    bool has_layer(int32_t il) const {
+        return il >= 0 && il < (int32_t) layers.size() && layers[il].ig >= 0;
+    }
+
     ggml_tensor * get_slot_map(int32_t il, int64_t n_tokens, int64_t n_expert_used) const {
         if (il < 0 || il >= (int32_t) layers.size() || layers[il].ig < 0) {
             return nullptr;
@@ -791,6 +799,9 @@ struct llama_moe_cache::impl {
     }
 
     bool copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph) {
+        if (backend != this->backend) {
+            return false;
+        }
         const auto it = layer_of.find(src);
         if (it == layer_of.end()) {
             return false;
@@ -922,6 +933,14 @@ void llama_moe_cache::bind_compute_buffer(ggml_backend_buffer_t compute_buf, siz
 
 void llama_moe_cache::on_prefill_start() {
     pimpl->on_prefill_start();
+}
+
+bool llama_moe_cache::empty() const {
+    return pimpl->empty();
+}
+
+bool llama_moe_cache::has_layer(int32_t il) const {
+    return pimpl->has_layer(il);
 }
 
 ggml_tensor * llama_moe_cache::get_slot_map(int32_t il, int64_t n_tokens, int64_t n_expert_used) const {

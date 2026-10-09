@@ -795,7 +795,7 @@ struct llm_graph_params {
     const llama_adapter_loras    * loras;
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
-    const llama_moe_cache        * moe_cache;
+    std::vector<const llama_moe_cache *> moe_caches;
 
     const llama_prec_policy * prec_policy = nullptr;
 
@@ -1039,7 +1039,10 @@ struct llm_graph_context {
     const llama_adapter_loras    * loras;
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
-    const llama_moe_cache        * moe_cache;
+    std::vector<const llama_moe_cache *> moe_caches;
+
+    const llama_moe_cache * get_moe_cache(int32_t il) const;
+    const llama_moe_cache * get_moe_cache(const ggml_tensor * w) const;
 
     const llama_prec_policy * prec_policy;
 

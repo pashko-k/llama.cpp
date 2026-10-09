@@ -466,18 +466,28 @@ llama_context::llama_context(
         }
 
         if (cparams.moe_cache_size > 0 || cparams.moe_cache_reuse_prefill) {
-            if (cparams.pipeline_parallel || model.n_devices() > 1) {
-                throw std::runtime_error("MoE cache does not support multiple devices");
+            if (cparams.pipeline_parallel) {
+                throw std::runtime_error("MoE cache does not support pipeline parallelism");
             }
+            if (model.split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
+                throw std::runtime_error("MoE cache does not support tensor parallelism");
+            }
+            bool has_gpu = false;
             for (size_t i = 0; i < backend_ptrs.size(); ++i) {
                 const auto type = ggml_backend_dev_type(ggml_backend_get_device(backend_ptrs[i]));
                 if (type == GGML_BACKEND_DEVICE_TYPE_GPU || type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
-                    moe_cache = std::make_unique<llama_moe_cache>(model, backend_ptrs[i], backend_buft[i], cparams.moe_cache_size, cparams.moe_cache_reuse_prefill);
-                    break;
+                    has_gpu = true;
+                    auto cache = std::make_unique<llama_moe_cache>(model, backend_ptrs[i], backend_buft[i], cparams.moe_cache_size, cparams.moe_cache_reuse_prefill);
+                    if (!cache->empty()) {
+                        moe_caches.push_back(std::move(cache));
+                    }
                 }
             }
-            if (!moe_cache) {
+            if (!has_gpu) {
                 throw std::runtime_error("MoE cache requires a GPU backend");
+            }
+            if (moe_caches.empty()) {
+                LLAMA_LOG_WARN("%s: no layer has all of its experts in host memory, MoE cache is disabled\n", __func__);
             }
         }
 
@@ -691,28 +701,18 @@ void llama_context::sched_reserve() {
 
     const uint32_t n_outputs_pp = std::min(n_tokens, cparams.n_outputs_max);
 
-    if (cparams.moe_cache_reuse_prefill && moe_cache) {
-        size_t gpu_idx = 0;
-        for (size_t i = 0; i < backend_ptrs.size(); ++i) {
-            if (backend_ptrs[i] == moe_cache->backend()) {
-                gpu_idx = i;
-                break;
-            }
-        }
-
+    if (cparams.moe_cache_reuse_prefill && !moe_caches.empty()) {
         std::vector<size_t> pp_sizes(backend_ptrs.size(), 0);
         std::vector<size_t> tg_sizes(backend_ptrs.size(), 0);
         graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(), /*split_only=*/ true, pp_sizes.data());
         graph_reserve(n_seqs,   n_seqs, n_seqs,        mctx.get(), /*split_only=*/ true, tg_sizes.data());
 
-        const size_t alignment = ggml_backend_buft_get_alignment(backend_buft[gpu_idx]);
-        const size_t s_tg = GGML_PAD(tg_sizes[gpu_idx], alignment);
-        const size_t s_pp = pp_sizes[gpu_idx];
-        const size_t s_ephem = s_pp > s_tg ? s_pp - s_tg : 0;
         const size_t s_persist = cparams.moe_cache_size;
 
-        if (s_persist > 0) {
-            ggml_backend_sched_set_tail_padding(sched.get(), moe_cache->backend(), s_persist);
+        for (const auto & cache : moe_caches) {
+            if (s_persist > 0) {
+                ggml_backend_sched_set_tail_padding(sched.get(), cache->backend(), s_persist);
+            }
         }
 
         auto * gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(),
@@ -723,8 +723,10 @@ void llama_context::sched_reserve() {
                 cparams.pipeline_parallel = false;
                 sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, cparams.op_offload));
                 ggml_backend_sched_set_copy_callback(sched.get(), sched_copy_experts, this);
-                if (s_persist > 0) {
-                    ggml_backend_sched_set_tail_padding(sched.get(), moe_cache->backend(), s_persist);
+                for (const auto & cache : moe_caches) {
+                    if (s_persist > 0) {
+                        ggml_backend_sched_set_tail_padding(sched.get(), cache->backend(), s_persist);
+                    }
                 }
                 gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get());
             }
@@ -738,8 +740,21 @@ void llama_context::sched_reserve() {
         n_inputs_pp        = get_gf_res_reserve()->inputs.size();
         n_input_tensors_pp = this->n_input_tensors;
 
-        ggml_backend_buffer_t compute_buf = ggml_backend_sched_get_buffer(sched.get(), moe_cache->backend());
-        moe_cache->bind_compute_buffer(compute_buf, s_tg, s_ephem, s_persist);
+        for (const auto & cache : moe_caches) {
+            size_t gpu_idx = 0;
+            for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+                if (backend_ptrs[i] == cache->backend()) {
+                    gpu_idx = i;
+                    break;
+                }
+            }
+            const size_t alignment = ggml_backend_buft_get_alignment(backend_buft[gpu_idx]);
+            const size_t s_tg = GGML_PAD(tg_sizes[gpu_idx], alignment);
+            const size_t s_pp = pp_sizes[gpu_idx];
+            const size_t s_ephem = s_pp > s_tg ? s_pp - s_tg : 0;
+            ggml_backend_buffer_t compute_buf = ggml_backend_sched_get_buffer(sched.get(), cache->backend());
+            cache->bind_compute_buffer(compute_buf, s_tg, s_ephem, s_persist);
+        }
     } else {
         // reserve pp (prompt processing) graph first so that buffers are only allocated once
         auto * gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(),
@@ -1473,8 +1488,10 @@ bool llama_context::set_adapter_cvec(
 }
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
-    if (ubatch.n_tokens > 32 && moe_cache) {
-        moe_cache->on_prefill_start();
+    if (ubatch.n_tokens > 32) {
+        for (auto & cache : moe_caches) {
+            cache->on_prefill_start();
+        }
     }
 
     if (mctx && !mctx->apply()) {
@@ -2665,6 +2682,12 @@ llm_graph_params llama_context::graph_params(
                       const llama_ubatch & ubatch,
             const llama_memory_context_i * mctx,
                           llm_graph_type   gtype) const {
+    std::vector<const llama_moe_cache *> moe_cache_ptrs;
+    moe_cache_ptrs.reserve(moe_caches.size());
+    for (const auto & cache : moe_caches) {
+        moe_cache_ptrs.push_back(cache.get());
+    }
+
     return {
         /*.arch        =*/ model.arch,
         /*.hparams     =*/ model.hparams,
@@ -2677,7 +2700,7 @@ llm_graph_params llama_context::graph_params(
         /*.loras       =*/ loras.get(),
         /*.mctx        =*/ mctx,
         /*.cross       =*/ &cross,
-        /*.moe_cache   =*/ moe_cache.get(),
+        /*.moe_caches  =*/ std::move(moe_cache_ptrs),
         /*.prec_policy =*/ &model.prec_policy,
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
@@ -2717,11 +2740,22 @@ ggml_status llama_context::graph_compute(
     return status;
 }
 
+llama_moe_cache * llama_context::get_moe_cache(ggml_backend_t backend) const {
+    for (const auto & cache : moe_caches) {
+        if (cache->backend() == backend) {
+            return cache.get();
+        }
+    }
+    return nullptr;
+}
+
 bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, void * user_data) {
     auto * lctx = static_cast<llama_context *>(user_data);
 
+    llama_moe_cache * cache = lctx->get_moe_cache(backend);
+
     // the slot maps of the MoE cache
-    if (lctx->moe_cache && lctx->moe_cache->copy(backend, src, dst, graph)) {
+    if (cache && cache->copy(backend, src, dst, graph)) {
         return true;
     }
 
@@ -2774,8 +2808,8 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
 
         // the experts in the MoE cache are copied from device memory, the others are uploaded
         int64_t next = first;
-        for (int64_t e = first; e <= last && lctx->moe_cache; ) {
-            const int64_t n = lctx->moe_cache->copy_experts(backend, src, dst, e, last);
+        for (int64_t e = first; e <= last && cache; ) {
+            const int64_t n = cache->copy_experts(backend, src, dst, e, last);
             if (n == 0) {
                 e++;
                 continue;
@@ -3660,8 +3694,8 @@ llama_memory_breakdown llama_context::memory_breakdown() const {
             ret[buft].context += size;
         }
     }
-    if (moe_cache) {
-        for (const auto & [buft, size] : moe_cache->memory_breakdown()) {
+    for (const auto & cache : moe_caches) {
+        for (const auto & [buft, size] : cache->memory_breakdown()) {
             ret[buft].context += size;
         }
     }

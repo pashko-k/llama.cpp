@@ -519,6 +519,7 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
     }
     if (moe_cache_reuse_prefill) {
         ctx_params.moe_cache_reuse_prefill = true;
+        ctx_params.n_ubatch = 2;
     }
 
     tensor_data_params tensor_params = { seed, stdev };
@@ -923,6 +924,10 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
             if (type == GGML_BACKEND_DEVICE_TYPE_GPU || type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
                 dev_configs.emplace_back(std::vector<ggml_backend_dev_t>{devices_meta[0]}, "MoE cache", LLAMA_SPLIT_MODE_LAYER, true, 1536*1024);
                 dev_configs.emplace_back(std::vector<ggml_backend_dev_t>{devices_meta[0]}, "MoE reuse prefill", LLAMA_SPLIT_MODE_LAYER, true, 0, true);
+                if (devices_meta.size() > 1) {
+                    dev_configs.emplace_back(devices_meta, "MoE cache multi-GPU", LLAMA_SPLIT_MODE_LAYER, true, 1536*1024);
+                    dev_configs.emplace_back(devices_meta, "MoE reuse prefill multi-GPU", LLAMA_SPLIT_MODE_LAYER, true, 0, true);
+                }
                 max_device_label_length = std::max(max_device_label_length, dev_configs.back().label.length());
             }
         }

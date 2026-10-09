@@ -22,6 +22,12 @@ public:
     // called when a prefill batch begins (n_tokens > 32) to invalidate ephemeral probationary slots
     void on_prefill_start();
 
+    // true if the cache has no cached layers
+    bool empty() const;
+
+    // true if layer il is cached by this instance
+    bool has_layer(int32_t il) const;
+
     // the slot map of layer il, if its experts can be read from the cache for n_tokens tokens, nullptr otherwise
     ggml_tensor * get_slot_map(int32_t il, int64_t n_tokens, int64_t n_expert_used) const;
 
