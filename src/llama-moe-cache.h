@@ -11,10 +11,16 @@ struct llama_model;
 // each layer has a slot map in host memory: when the scheduler copies it to the device, the copy callback uploads the missing experts
 class llama_moe_cache {
 public:
-    llama_moe_cache(const llama_model & model, ggml_backend_t backend, ggml_backend_buffer_type_t buft, size_t size);
+    llama_moe_cache(const llama_model & model, ggml_backend_t backend, ggml_backend_buffer_type_t buft, size_t size, bool reuse_prefill = false);
     ~llama_moe_cache();
 
     ggml_backend_t backend() const;
+
+    // bind the cache bank tensors to suballocated slices of a unified compute buffer
+    void bind_compute_buffer(ggml_backend_buffer_t compute_buf, size_t base_offset, size_t ephem_bytes, size_t persist_bytes);
+
+    // called when a prefill batch begins (n_tokens > 32) to invalidate ephemeral probationary slots
+    void on_prefill_start();
 
     // the slot map of layer il, if its experts can be read from the cache for n_tokens tokens, nullptr otherwise
     ggml_tensor * get_slot_map(int32_t il, int64_t n_tokens, int64_t n_expert_used) const;
