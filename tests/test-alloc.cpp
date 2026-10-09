@@ -1099,6 +1099,52 @@ static void test_buft_get_alloc_size_n_does_not_allocate() {
     GGML_ASSERT(x[1]->data == nullptr);
 }
 
+static void test_tail_padding() {
+    dummy_backend backend      = dummy_backend_init(SIZE_MAX);
+    auto [ctx, graph, ctx_ptr] = make_context();
+
+    ggml_tensor * a = make_input_with_size(ctx, 32);
+    ggml_tensor * b = make_input_with_size(ctx, 32);
+    ggml_tensor * c = ggml_add(ctx, a, b);
+    ggml_build_forward_expand(graph, c);
+    assign_names(ctx);
+
+    ggml_gallocr_t galloc = ggml_gallocr_new(&backend.buffer_type);
+    const size_t tail_pad = 64;
+    ggml_gallocr_set_tail_padding(galloc, 0, tail_pad);
+
+    bool ok = ggml_gallocr_reserve(galloc, graph);
+    GGML_ASSERT(ok);
+
+    size_t total_buf_size = ggml_gallocr_get_buffer_size(galloc, 0);
+    size_t pad_offset     = ggml_gallocr_get_tail_padding_offset(galloc, 0);
+
+    GGML_ASSERT(total_buf_size >= pad_offset + tail_pad);
+
+    ggml_backend_buffer_t buf = ggml_gallocr_get_buffer(galloc, 0);
+    GGML_ASSERT(buf != nullptr);
+    GGML_ASSERT(ggml_backend_buffer_get_size(buf) == total_buf_size);
+
+    ok = ggml_gallocr_alloc_graph(galloc, graph);
+    GGML_ASSERT(ok);
+
+    uint8_t * base = (uint8_t *) ggml_backend_buffer_get_base(buf);
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        if (graph->nodes[i]->data) {
+            size_t offset = (uint8_t *) graph->nodes[i]->data - base;
+            GGML_ASSERT(offset + ggml_nbytes(graph->nodes[i]) <= pad_offset);
+        }
+    }
+    for (int i = 0; i < graph->n_leafs; ++i) {
+        if (graph->leafs[i]->data) {
+            size_t offset = (uint8_t *) graph->leafs[i]->data - base;
+            GGML_ASSERT(offset + ggml_nbytes(graph->leafs[i]) <= pad_offset);
+        }
+    }
+
+    ggml_gallocr_free(galloc);
+}
+
 static void run(const char * name, void (*f)()) {
     printf("%s ", name);
     fflush(stdout);
@@ -1139,5 +1185,6 @@ int main() {
     run("test_buft_get_alloc_size_n_custom_override", test_buft_get_alloc_size_n_custom_override);
     run("test_buft_get_alloc_size_n_custom_override_ctx_size", test_buft_get_alloc_size_n_custom_override_ctx_size);
     run("test_buft_get_alloc_size_n_does_not_allocate", test_buft_get_alloc_size_n_does_not_allocate);
+    run("test_tail_padding", test_tail_padding);
     return 0;
 }
