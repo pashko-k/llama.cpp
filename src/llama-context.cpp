@@ -358,7 +358,8 @@ llama_context::llama_context(
 
     cparams.op_offload     = params.op_offload;
     cparams.kv_unified     = params.kv_unified;
-    cparams.moe_cache_size = params.moe_cache_size;
+    cparams.moe_cache_size          = params.moe_cache_size;
+    cparams.moe_cache_reuse_prefill = params.moe_cache_reuse_prefill;
 
     // initialized later
     cparams.pipeline_parallel = false;
@@ -548,8 +549,8 @@ llama_context::llama_context(
             LLAMA_LOG_INFO("%s: pipeline parallelism enabled\n", __func__);
         }
 
-        if (cparams.moe_cache_size > 0) {
-            moe_cache = std::make_unique<llama_moe_cache>(model, backend_ptrs, backend_buft, cparams.moe_cache_size);
+        if (cparams.moe_cache_size > 0 || cparams.moe_cache_reuse_prefill) {
+            moe_cache = std::make_unique<llama_moe_cache>(model, backend_ptrs, backend_buft, cparams.moe_cache_size, cparams.moe_cache_reuse_prefill);
         }
 
         sched_reserve();
@@ -769,8 +770,54 @@ void llama_context::sched_reserve() {
 
     const uint32_t n_outputs_pp = std::min(n_tokens, cparams.n_outputs_max);
 
-    // reserve pp (prompt processing) graph first so that buffers are only allocated once
-    {
+    if (cparams.moe_cache_reuse_prefill && moe_cache) {
+        std::vector<size_t> pp_sizes(backend_ptrs.size(), 0);
+        std::vector<size_t> tg_sizes(backend_ptrs.size(), 0);
+        graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(), /*split_only=*/ true, pp_sizes.data());
+        graph_reserve(n_seqs,   n_seqs, n_seqs,        mctx.get(), /*split_only=*/ true, tg_sizes.data());
+
+        // the persistent part of the cache is kept in the tail padding of the compute buffer
+        auto set_tail_padding = [&]() {
+            for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+                const size_t s_persist = moe_cache->cache_size(backend_ptrs[i]);
+                if (s_persist > 0) {
+                    ggml_backend_sched_set_tail_padding(sched.get(), backend_ptrs[i], s_persist);
+                }
+            }
+        };
+        set_tail_padding();
+
+        auto * gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(),
+                model.hparams.no_alloc, model.hparams.no_alloc ? backend_buf_exp_size.data() : nullptr);
+        if (!gf) {
+            if (cparams.pipeline_parallel) {
+                LLAMA_LOG_WARN("%s: compute buffer allocation failed, retrying without pipeline parallelism\n", __func__);
+                cparams.pipeline_parallel = false;
+                sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, cparams.op_offload));
+                ggml_backend_sched_set_copy_callback(sched.get(), sched_copy_experts, this);
+                set_tail_padding();
+                gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get());
+            }
+            if (!gf) {
+                throw std::runtime_error("failed to allocate compute pp buffers");
+            }
+        }
+
+        n_splits_pp        = ggml_backend_sched_get_n_splits(sched.get());
+        n_nodes_pp         = ggml_graph_n_nodes(gf);
+        n_inputs_pp        = get_gf_res_reserve()->inputs.size();
+        n_input_tensors_pp = this->n_input_tensors;
+
+        // the cache banks are bound to the tail of the compute buffer of each backend
+        for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+            const size_t alignment = ggml_backend_buft_get_alignment(backend_buft[i]);
+            const size_t s_tg      = GGML_PAD(tg_sizes[i], alignment);
+            const size_t s_pp      = pp_sizes[i];
+            const size_t s_ephem   = s_pp > s_tg ? s_pp - s_tg : 0;
+            moe_cache->bind_compute_buffer(backend_ptrs[i], ggml_backend_sched_get_buffer(sched.get(), backend_ptrs[i]), s_tg, s_ephem, moe_cache->cache_size(backend_ptrs[i]));
+        }
+    } else {
+        // reserve pp (prompt processing) graph first so that buffers are only allocated once
         auto * gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(),
                 model.hparams.no_alloc, model.hparams.no_alloc ? backend_buf_exp_size.data() : nullptr);
         if (!gf) {
@@ -1505,6 +1552,10 @@ bool llama_context::set_adapter_cvec(
 }
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+    if (ubatch.n_tokens > 32 && moe_cache) {
+        moe_cache->on_prefill_start();
+    }
+
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
@@ -4010,6 +4061,7 @@ llama_context_params llama_context_default_params() {
         /*.op_offload                  =*/ true,
         /*.swa_full                    =*/ true,
         /*.kv_unified                  =*/ false,
+        /*.moe_cache_reuse_prefill     =*/ false,
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
         /*.ctx_other                   =*/ nullptr,

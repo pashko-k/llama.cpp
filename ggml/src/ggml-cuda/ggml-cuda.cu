@@ -5191,13 +5191,20 @@ void ggml_backend_cuda_get_device_memory(int device, size_t * free, size_t * tot
     *total /= share_count;
 }
 
-bool ggml_backend_cuda_register_host_buffer(void * buffer, size_t size) {
-    if (!ggml_cuda_register_host_enabled()) {
+static bool ggml_backend_cuda_register_host_buffer_impl(void * buffer, size_t size, bool check_env) {
+    if (check_env && !ggml_cuda_register_host_enabled()) {
+        return false;
+    }
+    if (ggml_cuda_pinned_memory_disabled()) {
         return false;
     }
 
 #if CUDART_VERSION >= 11010 || defined(GGML_USE_MUSA) || defined(GGML_USE_HIP)
     cudaError_t err = cudaHostRegister(buffer, size, cudaHostRegisterPortable | cudaHostRegisterReadOnly);
+    if (err == cudaErrorHostMemoryAlreadyRegistered) {
+        (void)cudaGetLastError();
+        return true;
+    }
     if (err != cudaSuccess) {
         // clear the error
         (void)cudaGetLastError();
@@ -5214,8 +5221,8 @@ bool ggml_backend_cuda_register_host_buffer(void * buffer, size_t size) {
 #endif // CUDART_VERSION >= 11010 || defined(GGML_USE_MUSA)
 }
 
-void ggml_backend_cuda_unregister_host_buffer(void * buffer) {
-    if (!ggml_cuda_register_host_enabled()) {
+static void ggml_backend_cuda_unregister_host_buffer_impl(void * buffer, bool check_env) {
+    if (check_env && !ggml_cuda_register_host_enabled()) {
         return;
     }
 
@@ -5224,6 +5231,22 @@ void ggml_backend_cuda_unregister_host_buffer(void * buffer) {
         // clear the error
         (void)cudaGetLastError();
     }
+}
+
+bool ggml_backend_cuda_register_host_buffer(void * buffer, size_t size) {
+    return ggml_backend_cuda_register_host_buffer_impl(buffer, size, /*check_env=*/ true);
+}
+
+void ggml_backend_cuda_unregister_host_buffer(void * buffer) {
+    ggml_backend_cuda_unregister_host_buffer_impl(buffer, /*check_env=*/ true);
+}
+
+bool ggml_backend_cuda_register_host_buffer_always(void * buffer, size_t size) {
+    return ggml_backend_cuda_register_host_buffer_impl(buffer, size, /*check_env=*/ false);
+}
+
+void ggml_backend_cuda_unregister_host_buffer_always(void * buffer) {
+    ggml_backend_cuda_unregister_host_buffer_impl(buffer, /*check_env=*/ false);
 }
 
 
@@ -6049,6 +6072,12 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_comm_allreduce_tensor") == 0) {
         return (void *)ggml_backend_cuda_comm_allreduce_tensor;
+    }
+    if (strcmp(name, "ggml_backend_register_host_buffer_always") == 0) {
+        return (void *)ggml_backend_cuda_register_host_buffer_always;
+    }
+    if (strcmp(name, "ggml_backend_unregister_host_buffer_always") == 0) {
+        return (void *)ggml_backend_cuda_unregister_host_buffer_always;
     }
     if (strcmp(name, "ggml_backend_register_host_buffer") == 0) {
         return (void *)ggml_backend_cuda_register_host_buffer;
