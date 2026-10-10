@@ -934,7 +934,7 @@ static bool ggml_gallocr_reserve_n_impl(
         // even if there are no tensors allocated in this buffer, we still need to allocate it to initialize views
         bool realloc = galloc->buffers[i] == NULL;
         size_t new_size = 0;
-        size_t tail_pad = galloc->tail_pad_bytes ? galloc->tail_pad_bytes[i] : 0;
+        size_t tail_pad = galloc->tail_pad_bytes[i];
         int n_chunks = galloc->buf_tallocs[i]->n_chunks;
         if (n_chunks == 0 && tail_pad > 0) {
             size_t cur_size = galloc->buffers[i] ? ggml_vbuffer_chunk_size(galloc->buffers[i], 0) : 0;
@@ -1164,6 +1164,7 @@ size_t ggml_gallocr_get_tail_padding_offset(ggml_gallocr_t galloc, int buffer_id
         return 0;
     }
 
+    // max_size is already alignment-multiple because tallocr aligns each allocation
     size_t offset = galloc->buf_tallocs[buffer_id]->chunks[n_chunks - 1]->max_size;
     size_t align = galloc->buf_tallocs[buffer_id]->alignment;
     if (align > 0) {
