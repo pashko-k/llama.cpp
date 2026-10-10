@@ -727,6 +727,18 @@ struct server_slot {
         }
 
         common_speculative_print_stats(spec);
+
+        const auto moe_data = llama_perf_moe_cache(ctx_tgt);
+        if (moe_data.hits + moe_data.misses > 0) {
+            const size_t total_lookups = moe_data.hits + moe_data.misses;
+            const double throughput = moe_data.time_us > 0 ? (double) moe_data.bytes / (double) moe_data.time_us * 1e6 / 1024.0 / 1024.0 / 1024.0 : 0.0;
+            SLT_INF(*this,
+                    "MoE cache: hits = %zu, misses = %zu, hit rate = %.2f%%, uploaded = %.2f MiB (%.2f GB/s), slots = %d\n",
+                    moe_data.hits, moe_data.misses, 100.0 * moe_data.hits / total_lookups,
+                    moe_data.bytes / 1024.0 / 1024.0, throughput, moe_data.n_slots);
+        } else if (moe_data.n_slots > 0) {
+            SLT_INF(*this, "MoE cache: active (%d slots), no accesses in this pass\n", moe_data.n_slots);
+        }
     }
 
     json to_json(bool only_metrics = false) const {

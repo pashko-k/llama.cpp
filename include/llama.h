@@ -1698,9 +1698,19 @@ extern "C" {
         int32_t n_sample;   // number of sampled tokens
     };
 
-    LLAMA_API struct llama_perf_context_data llama_perf_context      (const struct llama_context * ctx);
-    LLAMA_API void                           llama_perf_context_print(const struct llama_context * ctx);
-    LLAMA_API void                           llama_perf_context_reset(      struct llama_context * ctx);
+    struct llama_perf_moe_cache_data {
+        size_t hits;
+        size_t misses;
+        size_t bytes;
+        int64_t time_us;
+        int32_t n_slots;
+    };
+
+    LLAMA_API struct llama_perf_context_data   llama_perf_context        (const struct llama_context * ctx);
+    LLAMA_API void                             llama_perf_context_print  (const struct llama_context * ctx);
+    LLAMA_API void                             llama_perf_context_reset  (      struct llama_context * ctx);
+    LLAMA_API struct llama_perf_moe_cache_data llama_perf_moe_cache      (const struct llama_context * ctx);
+    LLAMA_API void                             llama_perf_moe_cache_print(const struct llama_context * ctx);
 
     // NOTE: the following work only with samplers constructed via llama_sampler_chain_init
     LLAMA_API struct llama_perf_sampler_data llama_perf_sampler      (const struct llama_sampler * chain);

@@ -196,6 +196,8 @@ struct llama_context {
 
     llama_perf_context_data perf_get_data() const;
     void perf_reset();
+    llama_perf_moe_cache_data perf_moe_cache_get_data() const;
+    void perf_moe_cache_print() const;
 
     llama_memory_breakdown memory_breakdown() const;
 
