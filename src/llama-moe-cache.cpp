@@ -579,13 +579,6 @@ struct llama_moe_cache::impl {
         return true;
     }
 
-    void on_prefill_start() {
-        for (group & g : groups) {
-            g.lru.invalidate_ephemeral();
-        }
-    }
-
-
     ggml_tensor * get_slot_map(int32_t il, int64_t n_tokens, int64_t n_expert_used) const {
         if (!is_enabled() || il < 0 || il >= (int32_t) layers.size() || layers[il].ig < 0) {
             return nullptr;
@@ -796,10 +789,6 @@ void llama_moe_cache::set_ephem_enabled(bool enabled) {
 
 bool llama_moe_cache::is_enabled() const {
     return pimpl->is_enabled();
-}
-
-void llama_moe_cache::on_prefill_start() {
-    pimpl->on_prefill_start();
 }
 
 ggml_tensor * llama_moe_cache::get_slot_map(int32_t il, int64_t n_tokens, int64_t n_expert_used) const {

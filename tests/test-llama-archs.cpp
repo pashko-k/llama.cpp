@@ -519,6 +519,8 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
     }
     if (moe_cache_reuse_prefill) {
         ctx_params.moe_cache_reuse_prefill = true;
+        // keep synthetic pp footprint small and avoid GPU OOM in CI
+        ctx_params.n_ubatch = 2;
     }
 
     tensor_data_params tensor_params = { seed, stdev };

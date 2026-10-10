@@ -372,9 +372,6 @@ public:
 
     void set_ephem_enabled(bool enabled);
 
-    // called when a prefill batch begins to invalidate ephemeral probationary slots
-    void on_prefill_start();
-
     // true if the cache can accept queries for the current batch
     bool is_enabled() const;
 

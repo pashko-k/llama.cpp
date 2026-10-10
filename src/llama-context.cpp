@@ -771,10 +771,16 @@ void llama_context::sched_reserve() {
     const uint32_t n_outputs_pp = std::min(n_tokens, cparams.n_outputs_max);
 
     if (cparams.moe_cache_reuse_prefill && moe_cache) {
+        // decode disables the ephemeral tier for batches larger than max_batch (they overflow the
+        // sized region and overwrite the cache), so s_tg must be able to fit at least max_batch
+        // tokens to prevent corruption during speculative decoding verification.
+        const uint32_t n_tokens_tg = std::min(n_tokens, std::max(n_seqs, (uint32_t) llama_moe_cache::max_batch));
+        const uint32_t n_outputs_tg = n_tokens_tg;
+
         std::vector<size_t> pp_sizes(backend_ptrs.size(), 0);
         std::vector<size_t> tg_sizes(backend_ptrs.size(), 0);
         graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(), /*split_only=*/ true, pp_sizes.data());
-        graph_reserve(n_seqs,   n_seqs, n_seqs,        mctx.get(), /*split_only=*/ true, tg_sizes.data());
+        graph_reserve(n_tokens_tg, n_seqs, n_outputs_tg, mctx.get(), /*split_only=*/ true, tg_sizes.data());
 
         // the persistent part of the cache is kept in the tail padding of the compute buffer
         auto set_tail_padding = [&]() {
@@ -1435,6 +1441,12 @@ void llama_context::set_warmup(bool value) {
     //sched_need_reserve = true;
 }
 
+void llama_context::set_moe_cache_ephem_enabled(bool enabled) {
+    if (moe_cache) {
+        moe_cache->set_ephem_enabled(enabled);
+    }
+}
+
 bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
     if (!sampler && sampling.samplers.count(seq_id) == 0) {
         return true;
@@ -1552,10 +1564,6 @@ bool llama_context::set_adapter_cvec(
 }
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
-    if (ubatch.n_tokens > 32 && moe_cache) {
-        moe_cache->on_prefill_start();
-    }
-
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
@@ -1962,6 +1970,15 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
     output_swaps.clear();
     embd_batch_idxs.clear();
+
+    // the ephemeral MoE cache tier lives in the prefill headroom: a batch larger than the sized
+    // decode region overwrites it, so disable the tier for that decode (the slot maps are cleared
+    // by the invalidation and the next smaller decode re-enables the tier)
+    if (n_tokens_all > (uint32_t) llama_moe_cache::max_batch) {
+        set_moe_cache_ephem_enabled(false);
+    } else {
+        set_moe_cache_ephem_enabled(true);
+    }
 
     sched_reserve();
 
