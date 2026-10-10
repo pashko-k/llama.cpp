@@ -15,287 +15,6 @@
 
 namespace {
 
-// Segmented LRU (SLRU) of the experts of a group of layers
-// Protected segment holds hot anchor experts, probationary segment handles transient traffic
-struct moe_cache_lru {
-    int32_t n_expert = 0;
-    int32_t n_slots  = 0;
-    int32_t n_ephem  = 0;
-    int32_t n_prot_max = 0;
-    int32_t n_prot = 0;
-
-    std::vector<int32_t *> slot_map; // [n_layer] data of the slot maps, -1 if the expert is not cached
-    std::vector<int32_t>   key_of;   // [n_slots] il*n_expert + expert, -1 if empty
-    std::vector<bool>      is_protected; // [n_slots] true if in protected segment
-
-    // doubly linked list of the slots
-    std::vector<int32_t> prev;
-    std::vector<int32_t> next;
-    int32_t head_prob = -1;
-    int32_t tail_prob = -1;
-    int32_t head_prot = -1;
-    int32_t tail_prot = -1;
-
-    std::vector<uint32_t> seen; // [n_expert]
-    uint32_t seen_gen = 0;
-    std::vector<int32_t> uniq;
-    std::vector<int32_t> miss_slots;
-
-    void remove_node(int32_t s, int32_t & head, int32_t & tail) {
-        if (prev[s] >= 0) {
-            next[prev[s]] = next[s];
-        } else {
-            head = next[s];
-        }
-        if (next[s] >= 0) {
-            prev[next[s]] = prev[s];
-        } else {
-            tail = prev[s];
-        }
-        prev[s] = -1;
-        next[s] = -1;
-    }
-
-    void push_tail_node(int32_t s, int32_t & head, int32_t & tail) {
-        prev[s] = tail;
-        next[s] = -1;
-        if (tail >= 0) {
-            next[tail] = s;
-        } else {
-            head = s;
-        }
-        tail = s;
-    }
-
-    void init(int32_t n_layer, int32_t n_expert, int32_t n_slots, int32_t n_ephem = 0) {
-        this->n_expert   = n_expert;
-        this->n_slots    = n_slots;
-        this->n_ephem    = n_ephem;
-        const int32_t n_persist = n_slots - n_ephem;
-
-        if (n_ephem > 0 && n_persist > 0) {
-            this->n_prot_max = n_persist;
-            this->n_prot     = 0;
-        } else if (n_ephem > 0) {
-            this->n_prot_max = 0;
-            this->n_prot     = 0;
-        } else {
-            this->n_prot_max = std::max(0, (n_slots * 3) / 4); // 75% protected, 25% probationary
-            this->n_prot     = 0;
-        }
-
-        slot_map.assign(n_layer, nullptr);
-        key_of.assign(n_slots, -1);
-        is_protected.assign(n_slots, false);
-        prev.resize(n_slots);
-        next.resize(n_slots);
-
-        if (n_ephem > 0 && n_persist > 0) {
-            for (int32_t s = 0; s < n_ephem; ++s) {
-                prev[s] = s - 1;
-                next[s] = s + 1 < n_ephem ? s + 1 : -1;
-                is_protected[s] = false;
-            }
-            head_prob = 0;
-            tail_prob = n_ephem - 1;
-
-            for (int32_t s = n_ephem; s < n_slots; ++s) {
-                prev[s] = s - 1 >= n_ephem ? s - 1 : -1;
-                next[s] = s + 1 < n_slots ? s + 1 : -1;
-                is_protected[s] = true;
-            }
-            head_prot = n_ephem;
-            tail_prot = n_slots - 1;
-        } else {
-            for (int32_t s = 0; s < n_slots; ++s) {
-                prev[s] = s - 1;
-                next[s] = s + 1 < n_slots ? s + 1 : -1;
-            }
-            head_prob = 0;
-            tail_prob = n_slots - 1;
-            head_prot = -1;
-            tail_prot = -1;
-        }
-
-        seen.assign(n_expert, 0);
-    }
-
-    void invalidate_ephemeral() {
-        if (n_ephem <= 0) {
-            return;
-        }
-        for (int32_t s = 0; s < n_ephem; ++s) {
-            if (key_of[s] >= 0) {
-                slot_map[key_of[s] / n_expert][key_of[s] % n_expert] = -1;
-                key_of[s] = -1;
-            }
-            prev[s] = s - 1;
-            next[s] = s + 1 < n_ephem ? s + 1 : -1;
-            is_protected[s] = false;
-        }
-        head_prob = 0;
-        tail_prob = n_ephem - 1;
-    }
-
-    // touch slot s on hit: promote probationary to protected, or refresh protected
-    void touch(int32_t s) {
-        if (is_protected[s]) {
-            if (s != tail_prot) {
-                remove_node(s, head_prot, tail_prot);
-                push_tail_node(s, head_prot, tail_prot);
-            }
-        } else {
-            remove_node(s, head_prob, tail_prob);
-            push_tail_node(s, head_prot, tail_prot);
-            is_protected[s] = true;
-            n_prot++;
-
-            if (n_prot > n_prot_max && head_prot >= 0) {
-                int32_t demoted = head_prot;
-                remove_node(demoted, head_prot, tail_prot);
-                push_tail_node(demoted, head_prob, tail_prob);
-                is_protected[demoted] = false;
-                n_prot--;
-            }
-        }
-    }
-
-    // periodic decay demotes oldest protected slots to probationary
-    void decay() {
-        int32_t to_demote = n_prot / 4;
-        while (to_demote-- > 0 && head_prot >= 0) {
-            int32_t s = head_prot;
-            remove_node(s, head_prot, tail_prot);
-            push_tail_node(s, head_prob, tail_prob);
-            is_protected[s] = false;
-            n_prot--;
-        }
-    }
-
-    struct fill {
-        int32_t expert;
-        int32_t slot;
-    };
-
-    struct promotion {
-        int32_t expert;
-        int32_t src_slot;
-        int32_t dst_slot;
-    };
-
-    // plan slot assignments for layer il
-    bool plan(int32_t il, const int32_t * ids, size_t n_ids, std::vector<fill> & fills, std::vector<promotion> & promotions, size_t & n_hit) {
-        fills.clear();
-        promotions.clear();
-        n_hit = 0;
-
-        if (++seen_gen == 0) {
-            std::fill(seen.begin(), seen.end(), 0);
-            seen_gen = 1;
-        }
-        uniq.clear();
-        for (size_t i = 0; i < n_ids; ++i) {
-            GGML_ASSERT(ids[i] >= 0 && ids[i] < n_expert);
-            if (seen[ids[i]] != seen_gen) {
-                seen[ids[i]] = seen_gen;
-                uniq.push_back(ids[i]);
-            }
-        }
-        if (uniq.size() > (size_t) n_slots) {
-            return false;
-        }
-
-        int32_t * slots = slot_map[il];
-        const int32_t n_persist = n_slots - n_ephem;
-
-        // hits are touched and promoted first
-        for (int32_t e : uniq) {
-            if (slots[e] >= 0) {
-                int32_t s = slots[e];
-                n_hit++;
-                if (n_ephem > 0 && n_persist > 0 && s < n_ephem) {
-                    if (head_prot >= 0) {
-                        int32_t s_prot = head_prot;
-                        remove_node(s_prot, head_prot, tail_prot);
-                        push_tail_node(s_prot, head_prot, tail_prot);
-                        if (key_of[s_prot] >= 0) {
-                            slot_map[key_of[s_prot] / n_expert][key_of[s_prot] % n_expert] = -1;
-                        }
-                        key_of[s_prot] = il*n_expert + e;
-                        slots[e] = s_prot;
-
-                        remove_node(s, head_prob, tail_prob);
-                        push_tail_node(s, head_prob, tail_prob);
-                        key_of[s] = -1;
-
-                        promotions.push_back({ e, s, s_prot });
-                    }
-                } else if (n_ephem > 0 && n_persist > 0 && s >= n_ephem) {
-                    if (s != tail_prot && head_prot >= 0) {
-                        remove_node(s, head_prot, tail_prot);
-                        push_tail_node(s, head_prot, tail_prot);
-                    }
-                } else if (n_persist == 0) {
-                    if (s != tail_prob && head_prob >= 0) {
-                        remove_node(s, head_prob, tail_prob);
-                        push_tail_node(s, head_prob, tail_prob);
-                    }
-                } else {
-                    touch(s);
-                }
-            }
-        }
-
-        // sorted misses usually get consecutive slots, so uploads can be merged
-        std::sort(uniq.begin(), uniq.end());
-        miss_slots.clear();
-        for (int32_t e : uniq) {
-            if (slots[e] >= 0) {
-                continue;
-            }
-
-            int32_t s = -1;
-            if (n_ephem > 0) {
-                s = head_prob;
-                if (s >= 0) {
-                    remove_node(s, head_prob, tail_prob);
-                } else if (head_prot >= 0) {
-                    s = head_prot;
-                    remove_node(s, head_prot, tail_prot);
-                }
-            } else {
-                s = head_prob;
-                if (s >= 0) {
-                    remove_node(s, head_prob, tail_prob);
-                } else {
-                    GGML_ASSERT(head_prot >= 0);
-                    s = head_prot;
-                    remove_node(s, head_prot, tail_prot);
-                    is_protected[s] = false;
-                    n_prot--;
-                }
-            }
-
-            if (key_of[s] >= 0) {
-                slot_map[key_of[s] / n_expert][key_of[s] % n_expert] = -1;
-            }
-            key_of[s] = il*n_expert + e;
-            slots[e]  = s;
-
-            miss_slots.push_back(s);
-            fills.push_back({ e, s });
-        }
-
-        // push newly assigned miss slots to tail of probationary list
-        for (int32_t s : miss_slots) {
-            push_tail_node(s, head_prob, tail_prob);
-            is_protected[s] = false;
-        }
-
-        return true;
-    }
-};
-
 // gate, up, down or gate_up, down
 static std::vector<ggml_tensor *> llama_moe_cache_layer_experts(const llama_layer & layer) {
     std::vector<ggml_tensor *> res;
@@ -429,7 +148,7 @@ struct llama_moe_cache::impl {
         int64_t time_us = 0;
     };
 
-    static constexpr int64_t max_batch = 32;
+    static constexpr int64_t max_batch = llama_moe_cache::max_batch;
 
     const llama_model & model;
     size_t size;
@@ -671,7 +390,8 @@ struct llama_moe_cache::impl {
                 g.n_slots++;
             }
             if (g.n_slots < n_expert_used) {
-                LLAMA_LOG_WARN("%s: MoE cache budget is too small for %zu layers, they are not cached\n", __func__, g.layers.size());
+                LLAMA_LOG_WARN("%s: MoE cache budget is too small for %zu layers (budget = %.2f MiB, need %.2f MiB for %d slots), they are not cached\n",
+                    __func__, g.layers.size(), budget/1024.0/1024.0, alloc_size(g, n_expert_used)/1024.0/1024.0, n_expert_used);
                 g.n_slots = 0;
                 continue;
             }
@@ -842,14 +562,32 @@ struct llama_moe_cache::impl {
         allocate_device((size_t) (it - devices.begin()), compute_buf, base_offset, ephem_bytes, persist_bytes);
     }
 
+    void set_ephem_enabled(bool enabled) {
+        for (group & g : groups) {
+            g.lru.set_ephem_enabled(enabled);
+        }
+    }
+
+    bool is_enabled() const {
+        if (groups.empty()) {
+            return false;
+        }
+        if (reuse_prefill) {
+            // all groups share the same ephem_enabled state
+            return groups[0].lru.ephem_enabled;
+        }
+        return true;
+    }
+
     void on_prefill_start() {
         for (group & g : groups) {
             g.lru.invalidate_ephemeral();
         }
     }
 
+
     ggml_tensor * get_slot_map(int32_t il, int64_t n_tokens, int64_t n_expert_used) const {
-        if (il < 0 || il >= (int32_t) layers.size() || layers[il].ig < 0) {
+        if (!is_enabled() || il < 0 || il >= (int32_t) layers.size() || layers[il].ig < 0) {
             return nullptr;
         }
         const layer & l = layers[il];
@@ -862,11 +600,17 @@ struct llama_moe_cache::impl {
     }
 
     ggml_tensor * get_experts(const ggml_tensor * w) const {
+        if (!is_enabled()) {
+            return nullptr;
+        }
         const auto it = bindings.find(w);
         return it != bindings.end() ? it->second.cached : nullptr;
     }
 
     int64_t copy_experts(ggml_backend_t backend, const ggml_tensor * w, ggml_tensor * dst, int64_t e, int64_t last) {
+        if (!is_enabled()) {
+            return 0;
+        }
         const auto it = bindings.find(w);
         if (it == bindings.end()) {
             return 0;
@@ -1015,6 +759,17 @@ struct llama_moe_cache::impl {
             LLAMA_LOG_INFO("llama_moe_cache: large batches: %zu experts copied from the cache, %.2f MiB\n", stats_copy.hits, stats_copy.bytes/1024.0/1024.0);
         }
     }
+
+    void get_stats(size_t & out_hits, size_t & out_misses, size_t & out_bytes, int64_t & out_time_us, int32_t & out_slots) const {
+        out_hits    = stats_small.hits + stats_large.hits;
+        out_misses  = stats_small.misses + stats_large.misses;
+        out_bytes   = stats_small.bytes + stats_large.bytes;
+        out_time_us = stats_small.time_us + stats_large.time_us;
+        out_slots   = 0;
+        for (const auto & g : groups) {
+            out_slots += g.n_slots;
+        }
+    }
 };
 
 llama_moe_cache::llama_moe_cache(const llama_model & model, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size, bool reuse_prefill) :
@@ -1033,6 +788,14 @@ size_t llama_moe_cache::cache_size(ggml_backend_t backend) const {
 
 void llama_moe_cache::bind_compute_buffer(ggml_backend_t backend, ggml_backend_buffer_t compute_buf, size_t base_offset, size_t ephem_bytes, size_t persist_bytes) {
     pimpl->bind_compute_buffer(backend, compute_buf, base_offset, ephem_bytes, persist_bytes);
+}
+
+void llama_moe_cache::set_ephem_enabled(bool enabled) {
+    pimpl->set_ephem_enabled(enabled);
+}
+
+bool llama_moe_cache::is_enabled() const {
+    return pimpl->is_enabled();
 }
 
 void llama_moe_cache::on_prefill_start() {
@@ -1070,4 +833,12 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_moe_cache::memory_breakdown()
         }
     }
     return res;
+}
+
+void llama_moe_cache::print_stats() const {
+    pimpl->log_stats();
+}
+
+void llama_moe_cache::get_stats(size_t & hits, size_t & misses, size_t & bytes, int64_t & time_us, int32_t & n_slots) const {
+    pimpl->get_stats(hits, misses, bytes, time_us, n_slots);
 }
