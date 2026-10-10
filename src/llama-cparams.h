@@ -56,6 +56,7 @@ struct llama_cparams {
     bool training;           // set by llama_opt_init()
 
     size_t moe_cache_size;
+    std::vector<size_t> moe_cache_sizes; // per-device cache sizes in bytes, indexed by the model device
     bool   moe_cache_reuse_prefill = false;
 
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer

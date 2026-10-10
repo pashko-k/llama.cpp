@@ -354,9 +354,10 @@ static inline int32_t moe_cache_n_overlap(size_t offset, size_t size, size_t nb2
 // each layer has a slot map in host memory: when the scheduler copies it to the device, the copy callback uploads the missing experts
 class llama_moe_cache {
 public:
-    // backends are all the backends of the context, each GPU gets its own cache of the given size for the layers assigned to it
+    // backends are all the backends of the context, each GPU gets its own cache for the layers assigned to it
+    // if device_sizes is set, it holds the per-device budget indexed by the model device, otherwise size is split among the devices
     // if reuse_prefill is set, the cache banks are bound to suballocated slices of the compute buffer tail
-    llama_moe_cache(const llama_model & model, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size, bool reuse_prefill = false);
+    llama_moe_cache(const llama_model & model, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size, const size_t * device_sizes, bool reuse_prefill = false);
     ~llama_moe_cache();
 
     static constexpr int32_t max_batch = 32;

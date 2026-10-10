@@ -359,6 +359,9 @@ llama_context::llama_context(
     cparams.op_offload     = params.op_offload;
     cparams.kv_unified     = params.kv_unified;
     cparams.moe_cache_size          = params.moe_cache_size;
+    if (params.moe_cache_sizes != nullptr) {
+        cparams.moe_cache_sizes.assign(params.moe_cache_sizes, params.moe_cache_sizes + llama_max_devices());
+    }
     cparams.moe_cache_reuse_prefill = params.moe_cache_reuse_prefill;
 
     // initialized later
@@ -549,8 +552,17 @@ llama_context::llama_context(
             LLAMA_LOG_INFO("%s: pipeline parallelism enabled\n", __func__);
         }
 
-        if (cparams.moe_cache_size > 0 || cparams.moe_cache_reuse_prefill) {
-            moe_cache = std::make_unique<llama_moe_cache>(model, backend_ptrs, backend_buft, cparams.moe_cache_size, cparams.moe_cache_reuse_prefill);
+        bool has_moe_cache = cparams.moe_cache_size > 0 || cparams.moe_cache_reuse_prefill;
+        for (size_t s : cparams.moe_cache_sizes) {
+            if (s > 0) {
+                has_moe_cache = true;
+                break;
+            }
+        }
+
+        if (has_moe_cache) {
+            moe_cache = std::make_unique<llama_moe_cache>(model, backend_ptrs, backend_buft, cparams.moe_cache_size,
+                cparams.moe_cache_sizes.empty() ? nullptr : cparams.moe_cache_sizes.data(), cparams.moe_cache_reuse_prefill);
         }
 
         sched_reserve();
@@ -4070,6 +4082,7 @@ llama_context_params llama_context_default_params() {
         /*.type_k                      =*/ GGML_TYPE_F16,
         /*.type_v                      =*/ GGML_TYPE_F16,
         /*.moe_cache_size              =*/ 0,
+        /*.moe_cache_sizes             =*/ nullptr,
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,
         /*.embeddings                  =*/ false,

@@ -397,6 +397,7 @@ extern "C" {
         enum ggml_type type_v; // data type for V cache [EXPERIMENTAL]
 
         size_t moe_cache_size; // device cache in bytes for the experts kept in host memory, split among the devices like the layers, 0 = disabled [EXPERIMENTAL]
+        const size_t * moe_cache_sizes; // per-device cache sizes in bytes, indexed by the model device, size: llama_max_devices(), NULL = split moe_cache_size among the devices [EXPERIMENTAL]
 
         // Abort callback
         // if it returns true, execution of llama_decode() will be aborted

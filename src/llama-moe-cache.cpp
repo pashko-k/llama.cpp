@@ -98,7 +98,8 @@ struct llama_moe_cache::impl {
         ggml_backend_t backend;
         ggml_backend_buffer_type_t buft;
         size_t host_bytes = 0; // host experts of the layers it caches
-        double split = 0.0;    // share of the budget
+        double split = 0.0;    // share of the budget, when it is split among the devices
+        size_t budget = 0;     // the cache budget of the device in bytes
 
         // banks and their views
         ggml_context_ptr ctx;
@@ -188,7 +189,7 @@ struct llama_moe_cache::impl {
         return res;
     }
 
-    impl(const llama_model & model, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size, bool reuse_prefill) :
+    impl(const llama_model & model, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size, const size_t * device_sizes, bool reuse_prefill) :
             model(model), size(size), reuse_prefill(reuse_prefill),
             n_expert_used(model.hparams.n_expert_used_max()), layers(model.layers.size()) {
         for (size_t i = 0; i < backends.size(); ++i) {
@@ -276,33 +277,49 @@ struct llama_moe_cache::impl {
             }
         }
 
-        // the budget is split among the devices with host experts like the layers, by the tensor split or by default by free memory
-        const float * tensor_split = model.tensor_split();
-        const bool split_by_free = tensor_split == nullptr ||
-            std::all_of(tensor_split, tensor_split + model.n_devices(), [](float x) { return x == 0.0f; });
-        split_sum = 0.0;
-        for (device & d : devices) {
-            if (d.host_bytes == 0) {
-                continue;
-            }
-            ggml_backend_dev_t dev = ggml_backend_get_device(d.backend);
-            if (split_by_free) {
-                size_t free;
-                size_t total;
-                ggml_backend_dev_memory(dev, &free, &total);
-                d.split = (double) free;
-            } else {
-                const auto it = std::find_if(model.devices.begin(), model.devices.end(), [&](const llama_device & ld) { return ld.dev == dev; });
-                GGML_ASSERT(it != model.devices.end());
-                d.split = (double) tensor_split[it - model.devices.begin()];
-            }
-            split_sum += d.split;
-        }
-        if (split_sum == 0.0) {
-            // the devices do not report their free memory
+        // if device_sizes is set, it holds the per-device budget indexed by the model device,
+        // otherwise the budget is split among the devices with host experts like the layers, by the tensor split or by default by free memory
+        if (device_sizes == nullptr) {
+            const float * tensor_split = model.tensor_split();
+            const bool split_by_free = tensor_split == nullptr ||
+                std::all_of(tensor_split, tensor_split + model.n_devices(), [](float x) { return x == 0.0f; });
+            split_sum = 0.0;
             for (device & d : devices) {
-                d.split    = d.host_bytes > 0 ? 1.0 : 0.0;
+                if (d.host_bytes == 0) {
+                    continue;
+                }
+                ggml_backend_dev_t dev = ggml_backend_get_device(d.backend);
+                if (split_by_free) {
+                    size_t free;
+                    size_t total;
+                    ggml_backend_dev_memory(dev, &free, &total);
+                    d.split = (double) free;
+                } else {
+                    const auto it = std::find_if(model.devices.begin(), model.devices.end(), [&](const llama_device & ld) { return ld.dev == dev; });
+                    GGML_ASSERT(it != model.devices.end());
+                    d.split = (double) tensor_split[it - model.devices.begin()];
+                }
                 split_sum += d.split;
+            }
+            if (split_sum == 0.0) {
+                // the devices do not report their free memory
+                for (device & d : devices) {
+                    d.split    = d.host_bytes > 0 ? 1.0 : 0.0;
+                    split_sum += d.split;
+                }
+            }
+            for (device & d : devices) {
+                if (d.host_bytes > 0) {
+                    d.budget = (size_t) ((double) size*d.split/split_sum);
+                }
+            }
+        } else {
+            for (device & d : devices) {
+                if (d.host_bytes == 0) {
+                    continue;
+                }
+                const auto it = std::find_if(model.devices.begin(), model.devices.end(), [&](const llama_device & ld) { return ld.dev == ggml_backend_get_device(d.backend); });
+                d.budget = it != model.devices.end() ? device_sizes[it - model.devices.begin()] : 0;
             }
         }
 
@@ -314,7 +331,7 @@ struct llama_moe_cache::impl {
                 if (devices[id].host_bytes == 0) {
                     continue;
                 }
-                n_tensors += allocate_device(id, nullptr, 0, 0, (size_t) ((double) size*devices[id].split/split_sum));
+                n_tensors += allocate_device(id, nullptr, 0, 0, devices[id].budget);
             }
             if (n_tensors == 0) {
                 throw std::runtime_error("MoE cache is too small to hold the experts of one token");
@@ -551,7 +568,7 @@ struct llama_moe_cache::impl {
         if (it == devices.end() || it->host_bytes == 0) {
             return 0;
         }
-        return (size_t) ((double) size*it->split/split_sum);
+        return it->budget;
     }
 
     void bind_compute_buffer(ggml_backend_t backend, ggml_backend_buffer_t compute_buf, size_t base_offset, size_t ephem_bytes, size_t persist_bytes) {
@@ -765,8 +782,8 @@ struct llama_moe_cache::impl {
     }
 };
 
-llama_moe_cache::llama_moe_cache(const llama_model & model, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size, bool reuse_prefill) :
-    pimpl(new impl(model, backends, bufts, size, reuse_prefill)) {
+llama_moe_cache::llama_moe_cache(const llama_model & model, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size, const size_t * device_sizes, bool reuse_prefill) :
+    pimpl(new impl(model, backends, bufts, size, device_sizes, reuse_prefill)) {
 }
 
 llama_moe_cache::~llama_moe_cache() = default;
