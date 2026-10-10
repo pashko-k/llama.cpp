@@ -276,6 +276,9 @@ llama_context::llama_context(
     cparams.op_offload     = params.op_offload;
     cparams.kv_unified     = params.kv_unified;
     cparams.moe_cache_size          = params.moe_cache_size;
+    if (params.moe_cache_sizes != nullptr) {
+        cparams.moe_cache_sizes.assign(params.moe_cache_sizes, params.moe_cache_sizes + llama_max_devices());
+    }
     cparams.moe_cache_reuse_prefill = params.moe_cache_reuse_prefill;
 
     // initialized later
@@ -465,7 +468,15 @@ llama_context::llama_context(
             LLAMA_LOG_INFO("%s: pipeline parallelism enabled\n", __func__);
         }
 
-        if (cparams.moe_cache_size > 0 || cparams.moe_cache_reuse_prefill) {
+        bool has_moe_cache = cparams.moe_cache_size > 0 || cparams.moe_cache_reuse_prefill;
+        for (size_t s : cparams.moe_cache_sizes) {
+            if (s > 0) {
+                has_moe_cache = true;
+                break;
+            }
+        }
+
+        if (has_moe_cache) {
             if (cparams.pipeline_parallel) {
                 throw std::runtime_error("MoE cache does not support pipeline parallelism");
             }
@@ -477,7 +488,11 @@ llama_context::llama_context(
                 const auto type = ggml_backend_dev_type(ggml_backend_get_device(backend_ptrs[i]));
                 if (type == GGML_BACKEND_DEVICE_TYPE_GPU || type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
                     has_gpu = true;
-                    auto cache = std::make_unique<llama_moe_cache>(model, backend_ptrs[i], backend_buft[i], cparams.moe_cache_size, cparams.moe_cache_reuse_prefill);
+                    const size_t cache_size = moe_cache_get_size(backend_ptrs[i]);
+                    if (cache_size == 0 && !cparams.moe_cache_reuse_prefill) {
+                        continue;
+                    }
+                    auto cache = std::make_unique<llama_moe_cache>(model, backend_ptrs[i], backend_buft[i], cache_size, cparams.moe_cache_reuse_prefill);
                     if (!cache->empty()) {
                         moe_caches.push_back(std::move(cache));
                     }
@@ -669,6 +684,10 @@ void llama_context::sched_reserve() {
     gf_res_reserve.reset(new llm_graph_result(max_nodes));
     gf_res_prev_active = nullptr;
 
+    for (auto & cache : moe_caches) {
+        cache->unbind_compute_buffer();
+    }
+
     sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
     ggml_backend_sched_set_copy_callback(sched.get(), sched_copy_experts, this);
 
@@ -702,14 +721,20 @@ void llama_context::sched_reserve() {
     const uint32_t n_outputs_pp = std::min(n_tokens, cparams.n_outputs_max);
 
     if (cparams.moe_cache_reuse_prefill && !moe_caches.empty()) {
+        // TG graph must be sized to fit any batch that doesn't trigger on_prefill_start()
+        // (which invalidates the ephemeral cache). Since batches with <= max_batch tokens preserve
+        // the ephemeral cache, s_tg must be able to fit at least max_batch tokens to prevent corruption
+        // during speculative decoding verification.
+        const uint32_t n_tokens_tg = std::min(n_tokens, std::max(n_seqs, (uint32_t) llama_moe_cache::max_batch));
+        const uint32_t n_outputs_tg = n_tokens_tg;
+
         std::vector<size_t> pp_sizes(backend_ptrs.size(), 0);
         std::vector<size_t> tg_sizes(backend_ptrs.size(), 0);
         graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(), /*split_only=*/ true, pp_sizes.data());
-        graph_reserve(n_seqs,   n_seqs, n_seqs,        mctx.get(), /*split_only=*/ true, tg_sizes.data());
-
-        const size_t s_persist = cparams.moe_cache_size;
+        graph_reserve(n_tokens_tg, n_seqs, n_outputs_tg, mctx.get(), /*split_only=*/ true, tg_sizes.data());
 
         for (const auto & cache : moe_caches) {
+            const size_t s_persist = moe_cache_get_size(cache->backend());
             if (s_persist > 0) {
                 ggml_backend_sched_set_tail_padding(sched.get(), cache->backend(), s_persist);
             }
@@ -721,9 +746,13 @@ void llama_context::sched_reserve() {
             if (cparams.pipeline_parallel) {
                 LLAMA_LOG_WARN("%s: compute buffer allocation failed, retrying without pipeline parallelism\n", __func__);
                 cparams.pipeline_parallel = false;
+                for (auto & cache : moe_caches) {
+                    cache->unbind_compute_buffer();
+                }
                 sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, cparams.op_offload));
                 ggml_backend_sched_set_copy_callback(sched.get(), sched_copy_experts, this);
                 for (const auto & cache : moe_caches) {
+                    const size_t s_persist = moe_cache_get_size(cache->backend());
                     if (s_persist > 0) {
                         ggml_backend_sched_set_tail_padding(sched.get(), cache->backend(), s_persist);
                     }
@@ -748,10 +777,13 @@ void llama_context::sched_reserve() {
                     break;
                 }
             }
+            const size_t s_persist = moe_cache_get_size(cache->backend());
             const size_t alignment = ggml_backend_buft_get_alignment(backend_buft[gpu_idx]);
             const size_t s_tg = GGML_PAD(tg_sizes[gpu_idx], alignment);
             const size_t s_pp = pp_sizes[gpu_idx];
             const size_t s_ephem = s_pp > s_tg ? s_pp - s_tg : 0;
+            LLAMA_LOG_INFO("%s: cache[%zu] s_pp = %.2f MiB, s_tg = %.2f MiB, s_ephem = %.2f MiB, s_persist = %.2f MiB\n",
+                __func__, gpu_idx, s_pp/1024.0/1024.0, s_tg/1024.0/1024.0, s_ephem/1024.0/1024.0, s_persist/1024.0/1024.0);
             ggml_backend_buffer_t compute_buf = ggml_backend_sched_get_buffer(sched.get(), cache->backend());
             cache->bind_compute_buffer(compute_buf, s_tg, s_ephem, s_persist);
         }
@@ -1371,6 +1403,12 @@ void llama_context::set_warmup(bool value) {
     //sched_need_reserve = true;
 }
 
+void llama_context::set_moe_cache_ephem_enabled(bool enabled) {
+    for (auto & cache : moe_caches) {
+        cache->set_ephem_enabled(enabled);
+    }
+}
+
 bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
     if (!sampler && sampling.samplers.count(seq_id) == 0) {
         return true;
@@ -1488,12 +1526,6 @@ bool llama_context::set_adapter_cvec(
 }
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
-    if (ubatch.n_tokens > 32) {
-        for (auto & cache : moe_caches) {
-            cache->on_prefill_start();
-        }
-    }
-
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
@@ -1898,6 +1930,14 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
     output_swaps.clear();
     embd_batch_idxs.clear();
+
+    if (!moe_cache_ephem_user_controlled) {
+        if (n_tokens_all > (uint32_t) llama_moe_cache::max_batch) {
+            set_moe_cache_ephem_enabled(false);
+        } else {
+            set_moe_cache_ephem_enabled(true);
+        }
+    }
 
     sched_reserve();
 
@@ -2747,6 +2787,19 @@ llama_moe_cache * llama_context::get_moe_cache(ggml_backend_t backend) const {
         }
     }
     return nullptr;
+}
+
+size_t llama_context::moe_cache_get_size(ggml_backend_t backend) const {
+    if (!cparams.moe_cache_sizes.empty()) {
+        auto * dev = ggml_backend_get_device(backend);
+        for (size_t i = 0; i < model.devices.size(); ++i) {
+            if (model.devices[i].dev == dev) {
+                return i < cparams.moe_cache_sizes.size() ? cparams.moe_cache_sizes[i] : 0;
+            }
+        }
+    }
+    // fallback if device not found in model.devices or non-per-device mode
+    return cparams.moe_cache_size;
 }
 
 bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, void * user_data) {
@@ -3684,6 +3737,31 @@ void llama_context::perf_reset() {
     n_reused    = 0;
 }
 
+
+llama_perf_moe_cache_data llama_context::perf_moe_cache_get_data() const {
+    llama_perf_moe_cache_data res = {0, 0, 0, 0, 0};
+    for (const auto & cache : moe_caches) {
+        size_t hits = 0;
+        size_t misses = 0;
+        size_t bytes = 0;
+        int64_t time_us = 0;
+        int32_t n_slots = 0;
+        cache->get_stats(hits, misses, bytes, time_us, n_slots);
+        res.hits += hits;
+        res.misses += misses;
+        res.bytes += bytes;
+        res.time_us += time_us;
+        res.n_slots += n_slots;
+    }
+    return res;
+}
+
+void llama_context::perf_moe_cache_print() const {
+    for (const auto & cache : moe_caches) {
+        cache->print_stats();
+    }
+}
+
 llama_memory_breakdown llama_context::memory_breakdown() const {
     std::map<ggml_backend_buffer_type_t, llama_memory_breakdown_data> ret;
     for (const auto & [buft, size] : model.memory_breakdown()) {
@@ -3989,6 +4067,7 @@ llama_context_params llama_context_default_params() {
         /*.type_k                      =*/ GGML_TYPE_F16,
         /*.type_v                      =*/ GGML_TYPE_F16,
         /*.moe_cache_size              =*/ 0,
+        /*.moe_cache_sizes             =*/ nullptr,
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,
         /*.embeddings                  =*/ false,
@@ -4648,10 +4727,33 @@ void llama_perf_context_print(const llama_context * ctx) {
             __func__, data.t_eval_ms, data.n_eval, data.t_eval_ms / data.n_eval, 1e3 / data.t_eval_ms * data.n_eval);
     LLAMA_LOG_INFO("%s:       total time = %10.2f ms / %5d tokens\n", __func__, (t_end_ms - data.t_start_ms), (data.n_p_eval + data.n_eval));
     LLAMA_LOG_INFO("%s:    graphs reused = %10d\n", __func__, data.n_reused);
+
+    llama_perf_moe_cache_print(ctx);
 }
 
 void llama_perf_context_reset(llama_context * ctx) {
     ctx->perf_reset();
+}
+
+llama_perf_moe_cache_data llama_perf_moe_cache(const struct llama_context * ctx) {
+    if (!ctx) {
+        return {0, 0, 0, 0, 0};
+    }
+    return ctx->perf_moe_cache_get_data();
+}
+
+void llama_perf_moe_cache_print(const struct llama_context * ctx) {
+    if (!ctx) {
+        return;
+    }
+    ctx->perf_moe_cache_print();
+}
+
+void llama_set_moe_cache_ephem_enabled(struct llama_context * ctx, bool enabled) {
+    if (ctx) {
+        ctx->set_moe_cache_ephem_user_controlled(true);
+        ctx->set_moe_cache_ephem_enabled(enabled);
+    }
 }
 
 //

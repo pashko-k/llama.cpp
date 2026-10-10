@@ -123,6 +123,8 @@ struct llama_context {
     void set_nextn_layer_offset(int32_t offset);
     void set_causal_attn(bool value);
     void set_warmup(bool value);
+    void set_moe_cache_ephem_enabled(bool enabled);
+    void set_moe_cache_ephem_user_controlled(bool value) { moe_cache_ephem_user_controlled = value; }
 
     void set_adapters_lora(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
 
@@ -195,6 +197,8 @@ struct llama_context {
 
     llama_perf_context_data perf_get_data() const;
     void perf_reset();
+    llama_perf_moe_cache_data perf_moe_cache_get_data() const;
+    void perf_moe_cache_print() const;
 
     llama_memory_breakdown memory_breakdown() const;
 
@@ -277,6 +281,7 @@ private:
     static bool sched_copy_experts(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, void * user_data);
 
     llama_moe_cache * get_moe_cache(ggml_backend_t backend) const;
+    size_t moe_cache_get_size(ggml_backend_t backend) const;
 
     // disable auto fused ops (Flash Attention, Gated Delta Net) whose op lands on a device
     // that differs from the layer it belongs to (usually due to missing backend support)
@@ -304,6 +309,7 @@ private:
 
     llama_memory_ptr memory;
     std::vector<llama_moe_cache_ptr> moe_caches;
+    bool moe_cache_ephem_user_controlled = false;
 
     // decode output (2-dimensional array: [n_outputs][n_vocab])
     buffer_view<float> logits = {nullptr, 0};

@@ -397,6 +397,7 @@ extern "C" {
         enum ggml_type type_v; // data type for V cache [EXPERIMENTAL]
 
         size_t moe_cache_size; // device cache in bytes for the experts kept in host memory, 0 = disabled [EXPERIMENTAL]
+        const size_t * moe_cache_sizes; // per-device cache sizes in bytes, NULL = use moe_cache_size, size: llama_max_devices() [EXPERIMENTAL]
 
         // Abort callback
         // if it returns true, execution of llama_decode() will be aborted
@@ -1123,6 +1124,10 @@ extern "C" {
     DEPRECATED(LLAMA_API void llama_set_warmup(struct llama_context * ctx, bool warmup),
             "user code should do warmup runs manually [TAG_LLAMA_GRAPH_NO_WARMUP]");
 
+    // Enable or disable ephemeral MoE cache.
+    // llama_batch does not carry prompt-ness; callers must disable ephemeral tier when batch has prompt tokens.
+    LLAMA_API void llama_set_moe_cache_ephem_enabled(struct llama_context * ctx, bool enabled);
+
     // Set abort callback
     LLAMA_API void llama_set_abort_callback(struct llama_context * ctx, ggml_abort_callback abort_callback, void * abort_callback_data);
 
@@ -1694,9 +1699,19 @@ extern "C" {
         int32_t n_sample;   // number of sampled tokens
     };
 
-    LLAMA_API struct llama_perf_context_data llama_perf_context      (const struct llama_context * ctx);
-    LLAMA_API void                           llama_perf_context_print(const struct llama_context * ctx);
-    LLAMA_API void                           llama_perf_context_reset(      struct llama_context * ctx);
+    struct llama_perf_moe_cache_data {
+        size_t hits;
+        size_t misses;
+        size_t bytes;
+        int64_t time_us;
+        int32_t n_slots;
+    };
+
+    LLAMA_API struct llama_perf_context_data   llama_perf_context        (const struct llama_context * ctx);
+    LLAMA_API void                             llama_perf_context_print  (const struct llama_context * ctx);
+    LLAMA_API void                             llama_perf_context_reset  (      struct llama_context * ctx);
+    LLAMA_API struct llama_perf_moe_cache_data llama_perf_moe_cache      (const struct llama_context * ctx);
+    LLAMA_API void                             llama_perf_moe_cache_print(const struct llama_context * ctx);
 
     // NOTE: the following work only with samplers constructed via llama_sampler_chain_init
     LLAMA_API struct llama_perf_sampler_data llama_perf_sampler      (const struct llama_sampler * chain);
