@@ -517,6 +517,14 @@ llama_context::llama_context(
         LLAMA_LOG_DEBUG("%s: backend_ptrs.size() = %zu\n", __func__, backend_ptrs.size());
 
         // TODO: move these checks to ggml_backend_sched
+        bool has_moe_cache = cparams.moe_cache_size > 0 || cparams.moe_cache_reuse_prefill;
+        for (size_t s : cparams.moe_cache_sizes) {
+            if (s > 0) {
+                has_moe_cache = true;
+                break;
+            }
+        }
+
         // enabling pipeline parallelism in the scheduler increases memory usage, so it is only done when necessary
         bool pipeline_parallel =
             model.n_devices() > 1 &&
@@ -524,7 +532,7 @@ llama_context::llama_context(
             model.split_mode() == LLAMA_SPLIT_MODE_LAYER &&
             cparams.offload_kqv &&
             !model.has_tensor_overrides() &&
-            cparams.moe_cache_size == 0; // not supported by the MoE cache
+            !has_moe_cache; // not supported by the MoE cache
 
         // pipeline parallelism requires support for async compute and events in all devices
         if (pipeline_parallel) {
@@ -550,14 +558,6 @@ llama_context::llama_context(
 
         if (cparams.pipeline_parallel) {
             LLAMA_LOG_INFO("%s: pipeline parallelism enabled\n", __func__);
-        }
-
-        bool has_moe_cache = cparams.moe_cache_size > 0 || cparams.moe_cache_reuse_prefill;
-        for (size_t s : cparams.moe_cache_sizes) {
-            if (s > 0) {
-                has_moe_cache = true;
-                break;
-            }
         }
 
         if (has_moe_cache) {
@@ -751,6 +751,14 @@ void llama_context::sched_reserve() {
     gf_res_reserve.reset(new llm_graph_result(max_nodes));
     gf_res_prev_active = nullptr;
 
+    if (cparams.moe_cache_reuse_prefill && moe_cache) {
+        moe_cache->unbind();
+        moe_cache_buf.assign(backend_ptrs.size(), nullptr);
+        moe_cache_base.assign(backend_ptrs.size(), nullptr);
+        moe_cache_size.assign(backend_ptrs.size(), 0);
+        moe_cache_off.assign(backend_ptrs.size(), 0);
+    }
+
     sched_new(max_nodes, cparams.pipeline_parallel);
 
     llama_memory_context_ptr mctx;
@@ -782,6 +790,9 @@ void llama_context::sched_reserve() {
 
     const uint32_t n_outputs_pp = std::min(n_tokens, cparams.n_outputs_max);
 
+    std::vector<size_t> pp_sizes(backend_ptrs.size(), 0);
+    std::vector<size_t> tg_sizes(backend_ptrs.size(), 0);
+
     if (cparams.moe_cache_reuse_prefill && moe_cache) {
         // decode disables the ephemeral tier for batches larger than max_batch (they overflow the
         // sized region and overwrite the cache), so s_tg must be able to fit at least max_batch
@@ -789,8 +800,6 @@ void llama_context::sched_reserve() {
         const uint32_t n_tokens_tg = std::min(n_tokens, std::max(n_seqs, (uint32_t) llama_moe_cache::max_batch));
         const uint32_t n_outputs_tg = n_tokens_tg;
 
-        std::vector<size_t> pp_sizes(backend_ptrs.size(), 0);
-        std::vector<size_t> tg_sizes(backend_ptrs.size(), 0);
         graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(), /*split_only=*/ true, pp_sizes.data());
         graph_reserve(n_tokens_tg, n_seqs, n_outputs_tg, mctx.get(), /*split_only=*/ true, tg_sizes.data());
 
@@ -825,15 +834,6 @@ void llama_context::sched_reserve() {
         n_nodes_pp         = ggml_graph_n_nodes(gf);
         n_inputs_pp        = get_gf_res_reserve()->inputs.size();
         n_input_tensors_pp = this->n_input_tensors;
-
-        // the cache banks are bound to the tail of the compute buffer of each backend
-        for (size_t i = 0; i < backend_ptrs.size(); ++i) {
-            const size_t alignment = ggml_backend_buft_get_alignment(backend_buft[i]);
-            const size_t s_tg      = GGML_PAD(tg_sizes[i], alignment);
-            const size_t s_pp      = pp_sizes[i];
-            const size_t s_ephem   = s_pp > s_tg ? s_pp - s_tg : 0;
-            moe_cache->bind_compute_buffer(backend_ptrs[i], ggml_backend_sched_get_buffer(sched.get(), backend_ptrs[i]), s_tg, s_ephem, moe_cache->cache_size(backend_ptrs[i]));
-        }
     } else {
         // reserve pp (prompt processing) graph first so that buffers are only allocated once
         auto * gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(),
@@ -894,6 +894,30 @@ void llama_context::sched_reserve() {
 
         if (!gf) {
             throw std::runtime_error("failed to allocate compute pp buffers");
+        }
+    }
+
+    // bind the MoE cache banks after all the graph reservations, so that a reservation-triggered
+    // realloc cannot leave the banks pointing at freed buffers
+    if (cparams.moe_cache_reuse_prefill && moe_cache) {
+        moe_cache_buf.assign(backend_ptrs.size(), nullptr);
+        moe_cache_base.assign(backend_ptrs.size(), nullptr);
+        moe_cache_size.assign(backend_ptrs.size(), 0);
+        moe_cache_off.assign(backend_ptrs.size(), 0);
+        for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+            const size_t alignment = ggml_backend_buft_get_alignment(backend_buft[i]);
+            const size_t s_tg      = GGML_PAD(tg_sizes[i], alignment);
+            const size_t s_pp      = GGML_PAD(ggml_backend_sched_get_tail_padding_offset(sched.get(), backend_ptrs[i]), alignment);
+            const size_t s_ephem   = s_pp > s_tg ? s_pp - s_tg : 0;
+            const ggml_backend_buffer_t buf = ggml_backend_sched_get_buffer(sched.get(), backend_ptrs[i]);
+            if (moe_cache->bind_compute_buffer(backend_ptrs[i], buf, s_tg, s_ephem, moe_cache->cache_size(backend_ptrs[i]))) {
+                if (buf != nullptr) {
+                    moe_cache_buf[i]  = buf;
+                    moe_cache_base[i] = ggml_backend_buffer_get_base(buf);
+                    moe_cache_size[i] = ggml_backend_buffer_get_size(buf);
+                    moe_cache_off[i]  = s_tg;
+                }
+            }
         }
     }
 
@@ -1459,6 +1483,62 @@ void llama_context::set_moe_cache_ephem_enabled(bool enabled) {
     }
 }
 
+// the buffer pointer alone is not a reliable identity: the allocator can reuse the address of the freed
+// buffer struct for the replacement, so also compare the device base and the size (a realloc grows the buffer)
+static bool moe_cache_buf_changed(ggml_backend_buffer_t buf, ggml_backend_buffer_t old, void * old_base, size_t old_size) {
+    if (buf == nullptr) {
+        return true;
+    }
+    return buf != old || ggml_backend_buffer_get_base(buf) != old_base || ggml_backend_buffer_get_size(buf) != old_size;
+}
+
+// the MoE cache banks are bound to suballocated slices of the compute buffers. a graph larger than the reserved ones
+// makes the scheduler reallocate the buffers, which leaves the banks pointing at freed memory: rebind the banks to
+// the new buffers, the cached experts are lost
+bool llama_context::moe_cache_rebind_needed() const {
+    if (!cparams.moe_cache_reuse_prefill || !moe_cache || moe_cache_buf.empty()) {
+        return false;
+    }
+    for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+        if (moe_cache_buf[i] == nullptr) {
+            continue;
+        }
+        if (moe_cache_buf_changed(ggml_backend_sched_get_buffer(sched.get(), backend_ptrs[i]),
+                moe_cache_buf[i], moe_cache_base[i], moe_cache_size[i])) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool llama_context::moe_cache_rebind() {
+    if (!moe_cache_rebind_needed()) {
+        return false;
+    }
+    bool rebound = false;
+    for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+        if (moe_cache_buf[i] == nullptr) {
+            continue;
+        }
+        const ggml_backend_buffer_t buf = ggml_backend_sched_get_buffer(sched.get(), backend_ptrs[i]);
+        if (buf == nullptr || !moe_cache_buf_changed(buf, moe_cache_buf[i], moe_cache_base[i], moe_cache_size[i])) {
+            continue;
+        }
+        const size_t s_pp = ggml_backend_sched_get_tail_padding_offset(sched.get(), backend_ptrs[i]);
+        const size_t s_ephem = s_pp > moe_cache_off[i] ? s_pp - moe_cache_off[i] : 0;
+        LLAMA_LOG_WARN("%s: the %s compute buffer was reallocated (graph region %.2f MiB), rebinding the MoE cache, the cached experts are lost\n",
+                __func__, ggml_backend_buft_name(backend_buft[i]), s_pp/1024.0/1024.0);
+        // the old banks are dropped even if the new budget cannot fit any slot, so always record the new buffer
+        // and rebuild the graph: a failed bind just leaves the backend without a cache
+        (void) moe_cache->bind_compute_buffer(backend_ptrs[i], buf, moe_cache_off[i], s_ephem, moe_cache->cache_size(backend_ptrs[i]));
+        moe_cache_buf[i]  = buf;
+        moe_cache_base[i] = ggml_backend_buffer_get_base(buf);
+        moe_cache_size[i] = ggml_backend_buffer_get_size(buf);
+        rebound = true;
+    }
+    return rebound;
+}
+
 bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
     if (!sampler && sampling.samplers.count(seq_id) == 0) {
         return true;
@@ -1625,6 +1705,33 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             return nullptr;
         }
 
+        // if allocating the graph reallocated a compute buffer, the MoE cache banks were left dangling:
+        // rebind them and rebuild the graph, which still references the old banks.
+        // the rebuild can enable the cached experts path, which grows the graph and reallocates
+        // the buffer once more, hence the second pass
+        for (int i = 0; i < 2 && moe_cache_rebind(); ++i) {
+            res->reset();
+            ggml_backend_sched_reset(sched.get());
+            gf = model.build_graph(gparams);
+            if (!gf) {
+                LLAMA_LOG_ERROR("%s: failed to initialize graph\n", __func__);
+                ret = GGML_STATUS_FAILED;
+                return nullptr;
+            }
+            if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
+                LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
+                ret = GGML_STATUS_ALLOC_FAILED;
+                return nullptr;
+            }
+        }
+        // the second pass must have settled the buffer size, otherwise the graph still references
+        // freed buffers
+        if (moe_cache_rebind_needed()) {
+            LLAMA_LOG_ERROR("%s: the MoE cache compute buffer reallocation did not settle\n", __func__);
+            ret = GGML_STATUS_ALLOC_FAILED;
+            return nullptr;
+        }
+
         gf_res_prev_active = res;
     }
 
@@ -1692,6 +1799,10 @@ int llama_context::encode(const llama_batch_ext & batch_inp) {
     if (t_compute_start_us == 0) {
         t_compute_start_us = ggml_time_us();
     }
+
+    // the encoder graph overflows the sized decode region for any batch size, so the ephemeral
+    // tier is disabled for the whole encode (the next decode re-enables it)
+    set_moe_cache_ephem_enabled(false);
 
     sched_reserve();
 

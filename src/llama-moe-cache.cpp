@@ -348,9 +348,45 @@ struct llama_moe_cache::impl {
         log_stats();
     }
 
+    void unbind_device(size_t id) {
+        device & d = devices[id];
+        d.compute_buf = nullptr;
+        for (group & g : groups) {
+            if (g.id != (int32_t) id) {
+                continue;
+            }
+            for (int32_t il : g.layers) {
+                if (layers[il].slot_map != nullptr) {
+                    layer_of.erase(layers[il].slot_map);
+                }
+                for (const ggml_tensor * t : layers[il].experts) {
+                    bindings.erase(t);
+                }
+            }
+            g.banks.clear();
+            g.n_slots = 0;
+            g.n_ephem = 0;
+            g.lru.init(model.layers.size(), g.ref[0]->ne[2], 0, 0);
+        }
+        d.ctx.reset();
+        d.buf.reset();
+        d.buf_size = 0;
+        d.ctx_host.reset();
+        d.buf_host.reset();
+        d.buf_host_size = 0;
+    }
+
+    void unbind() {
+        for (size_t id = 0; id < devices.size(); ++id) {
+            unbind_device(id);
+        }
+    }
+
     // (re)allocate the banks of the device, either in an owned buffer (ext_buf == nullptr)
     // or in a slice of the compute buffer starting at base_offset
     size_t allocate_device(size_t id, ggml_backend_buffer_t ext_buf, size_t base_offset, size_t ephem_bytes, size_t persist_bytes) {
+        unbind_device(id);
+
         device & d = devices[id];
         d.compute_buf   = ext_buf;
         d.base_offset   = base_offset;
@@ -368,28 +404,6 @@ struct llama_moe_cache::impl {
             }
             return res;
         };
-
-        // drop the tensors of the previous allocation
-        for (group & g : groups) {
-            if (g.id != (int32_t) id) {
-                continue;
-            }
-            for (int32_t il : g.layers) {
-                if (layers[il].slot_map != nullptr) {
-                    layer_of.erase(layers[il].slot_map);
-                }
-                for (const ggml_tensor * t : layers[il].experts) {
-                    bindings.erase(t);
-                }
-            }
-            g.banks.clear();
-        }
-        d.ctx.reset();
-        d.buf.reset();
-        d.buf_size = 0;
-        d.ctx_host.reset();
-        d.buf_host.reset();
-        d.buf_host_size = 0;
 
         size_t n_tensors      = 0;
         size_t n_tensors_host = 0;
@@ -571,12 +585,15 @@ struct llama_moe_cache::impl {
         return it->budget;
     }
 
-    void bind_compute_buffer(ggml_backend_t backend, ggml_backend_buffer_t compute_buf, size_t base_offset, size_t ephem_bytes, size_t persist_bytes) {
+    bool bind_compute_buffer(ggml_backend_t backend, ggml_backend_buffer_t compute_buf, size_t base_offset, size_t ephem_bytes, size_t persist_bytes) {
         const auto it = std::find_if(devices.begin(), devices.end(), [&](const device & d) { return d.backend == backend; });
         if (it == devices.end() || it->host_bytes == 0) {
-            return;
+            return false;
         }
-        allocate_device((size_t) (it - devices.begin()), compute_buf, base_offset, ephem_bytes, persist_bytes);
+        if (!model.hparams.no_alloc && compute_buf == nullptr) {
+            return false;
+        }
+        return allocate_device((size_t) (it - devices.begin()), compute_buf, base_offset, ephem_bytes, persist_bytes) > 0;
     }
 
     void set_ephem_enabled(bool enabled) {
@@ -601,9 +618,11 @@ struct llama_moe_cache::impl {
             return nullptr;
         }
         const layer & l = layers[il];
+        const group & g = groups[l.ig];
 
+        // g.n_slots == 0 after unbind, slot_map is a dangling pointer then
         // large batches use most experts of a layer, so they gain little from the cache and would evict the experts used in generation
-        if (n_tokens == 0 || n_tokens > max_batch || std::min(n_tokens*n_expert_used, l.slot_map->ne[1]) > groups[l.ig].n_slots) {
+        if (n_tokens == 0 || n_tokens > max_batch || g.n_slots == 0 || std::min(n_tokens*n_expert_used, l.slot_map->ne[1]) > g.n_slots) {
             return nullptr;
         }
         return l.slot_map;
@@ -796,8 +815,12 @@ size_t llama_moe_cache::cache_size(ggml_backend_t backend) const {
     return pimpl->cache_size(backend);
 }
 
-void llama_moe_cache::bind_compute_buffer(ggml_backend_t backend, ggml_backend_buffer_t compute_buf, size_t base_offset, size_t ephem_bytes, size_t persist_bytes) {
-    pimpl->bind_compute_buffer(backend, compute_buf, base_offset, ephem_bytes, persist_bytes);
+bool llama_moe_cache::bind_compute_buffer(ggml_backend_t backend, ggml_backend_buffer_t compute_buf, size_t base_offset, size_t ephem_bytes, size_t persist_bytes) {
+    return pimpl->bind_compute_buffer(backend, compute_buf, base_offset, ephem_bytes, persist_bytes);
+}
+
+void llama_moe_cache::unbind() {
+    pimpl->unbind();
 }
 
 void llama_moe_cache::set_ephem_enabled(bool enabled) {

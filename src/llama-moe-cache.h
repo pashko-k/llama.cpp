@@ -368,8 +368,12 @@ public:
     // the share of the cache budget assigned to backend, 0 if it has no cached layers
     size_t cache_size(ggml_backend_t backend) const;
 
-    // bind the cache bank tensors of backend to suballocated slices of its compute buffer
-    void bind_compute_buffer(ggml_backend_t backend, ggml_backend_buffer_t compute_buf, size_t base_offset, size_t ephem_bytes, size_t persist_bytes);
+    // bind the cache bank tensors of backend to suballocated slices of its compute buffer,
+    // returns true if banks are bound
+    bool bind_compute_buffer(ggml_backend_t backend, ggml_backend_buffer_t compute_buf, size_t base_offset, size_t ephem_bytes, size_t persist_bytes);
+
+    // unbind the cache bank tensors from the compute buffer
+    void unbind();
 
     void set_ephem_enabled(bool enabled);
 
