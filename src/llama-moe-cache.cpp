@@ -366,7 +366,7 @@ struct llama_moe_cache::impl {
             g.banks.clear();
             g.n_slots = 0;
             g.n_ephem = 0;
-            g.lru.init(model.layers.size(), g.ref[0]->ne[2], 0, 0);
+            g.lru.init(model.layers.size(), g.ref[0]->ne[2], 0, 0, (int32_t) g.layers.size());
         }
         d.ctx.reset();
         d.buf.reset();
@@ -437,7 +437,7 @@ struct llama_moe_cache::impl {
                 }
                 g.n_ephem = std::min(n_eph, g.n_slots);
             }
-            g.lru.init(model.layers.size(), n_expert, g.n_slots, g.n_ephem);
+            g.lru.init(model.layers.size(), n_expert, g.n_slots, g.n_ephem, (int32_t) g.layers.size());
             n_tensors      += g.ref.size()*(1 + g.layers.size());
             n_tensors_host += g.layers.size();
         }
@@ -568,6 +568,8 @@ struct llama_moe_cache::impl {
                 LLAMA_LOG_INFO("%s: %2zu layers, %s: %5d slots (%.1f%%)\n", __func__,
                     g.layers.size(), ggml_type_name(g.ref.back()->type), g.n_slots, 100.0*g.n_slots/(g.layers.size()*g.ref[0]->ne[2]));
             }
+            LLAMA_LOG_INFO("%s: layer_budget_enabled = %s, active_layers = %d\n", __func__,
+                g.lru.layer_budget_enabled ? "true" : "false", g.lru.n_active_layers);
         }
 
         return n_tensors;
@@ -592,6 +594,9 @@ struct llama_moe_cache::impl {
         }
         if (!model.hparams.no_alloc && compute_buf == nullptr) {
             return false;
+        }
+        if (compute_buf != nullptr) {
+            GGML_ASSERT(base_offset + ephem_bytes + persist_bytes <= ggml_backend_buffer_get_size(compute_buf));
         }
         return allocate_device((size_t) (it - devices.begin()), compute_buf, base_offset, ephem_bytes, persist_bytes) > 0;
     }

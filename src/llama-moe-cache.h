@@ -19,10 +19,13 @@ struct moe_cache_lru {
     int32_t n_ephem    = 0;
     int32_t n_prot_max = 0;
     int32_t n_prot     = 0;
+    int32_t n_active_layers = 0;
 
     std::vector<int32_t *> slot_map; // [n_layer] data of the slot maps, -1 if the expert is not cached
     std::vector<int32_t>   key_of;   // [n_slots] il*n_expert + expert, -1 if empty
     std::vector<bool>      is_protected; // [n_slots] true if in protected segment
+    std::vector<int32_t>   n_prot_layer; // [n_layer] protected slots per layer
+    bool layer_budget_enabled = true;
 
     // doubly linked list of the slots
     std::vector<int32_t> prev;
@@ -72,11 +75,15 @@ struct moe_cache_lru {
         }
     }
 
-    void init(int32_t n_layer, int32_t n_expert, int32_t n_slots, int32_t n_ephem = 0) {
-        this->n_expert   = n_expert;
-        this->n_slots    = n_slots;
-        this->n_ephem    = n_ephem;
+    void init(int32_t n_layer, int32_t n_expert, int32_t n_slots, int32_t n_ephem = 0, int32_t n_active = 0) {
+        this->n_expert        = n_expert;
+        this->n_slots         = n_slots;
+        this->n_ephem         = n_ephem;
+        this->n_active_layers = n_active > 0 ? n_active : n_layer;
         const int32_t n_persist = n_slots - n_ephem;
+
+        const char * env_budget = getenv("LLAMA_MOE_CACHE_LAYER_BUDGET");
+        this->layer_budget_enabled = env_budget == nullptr || atoi(env_budget) != 0;
 
         if (n_ephem > 0 && n_persist > 0) {
             this->n_prot_max = n_persist;
@@ -92,6 +99,7 @@ struct moe_cache_lru {
         slot_map.assign(n_layer, nullptr);
         key_of.assign(n_slots, -1);
         is_protected.assign(n_slots, false);
+        n_prot_layer.assign(n_layer, 0);
         prev.resize(n_slots);
         next.resize(n_slots);
 
@@ -104,6 +112,7 @@ struct moe_cache_lru {
             head_prob = 0;
             tail_prob = n_ephem - 1;
 
+            // empty persistent slots initialize in protected chain as promotion victims
             for (int32_t s = n_ephem; s < n_slots; ++s) {
                 prev[s] = s - 1 >= n_ephem ? s - 1 : -1;
                 next[s] = s + 1 < n_slots ? s + 1 : -1;
@@ -173,6 +182,9 @@ struct moe_cache_lru {
             push_tail_node(s, head_prot, tail_prot);
             is_protected[s] = true;
             n_prot++;
+            if (key_of[s] >= 0) {
+                n_prot_layer[key_of[s] / n_expert]++;
+            }
 
             if (n_prot > n_prot_max && head_prot >= 0) {
                 int32_t demoted = head_prot;
@@ -180,6 +192,9 @@ struct moe_cache_lru {
                 push_tail_node(demoted, head_prob, tail_prob);
                 is_protected[demoted] = false;
                 n_prot--;
+                if (key_of[demoted] >= 0) {
+                    n_prot_layer[key_of[demoted] / n_expert]--;
+                }
             }
         }
     }
@@ -196,6 +211,9 @@ struct moe_cache_lru {
             push_tail_node(s, head_prob, tail_prob);
             is_protected[s] = false;
             n_prot--;
+            if (key_of[s] >= 0) {
+                n_prot_layer[key_of[s] / n_expert]--;
+            }
         }
     }
 
@@ -212,6 +230,8 @@ struct moe_cache_lru {
 
     // plan slot assignments for layer il
     bool plan(int32_t il, const int32_t * ids, size_t n_ids, std::vector<fill> & fills, std::vector<promotion> & promotions, size_t & n_hit) {
+        GGML_ASSERT(il >= 0 && il < (int32_t) slot_map.size());
+
         fills.clear();
         promotions.clear();
         n_hit = 0;
@@ -244,13 +264,87 @@ struct moe_cache_lru {
                 if (eff_ephem > 0 && n_persist > 0 && s < eff_ephem) {
                     if (head_prot >= 0) {
                         int32_t s_prot = head_prot;
+
+                        // layer-adaptive victim selection when persistent capacity is full
+                        if (layer_budget_enabled && key_of[head_prot] >= 0 && n_active_layers > 1) {
+                            const int32_t fair_share = std::max(1, n_persist / n_active_layers);
+                            const int32_t floor_min  = std::max(1, std::min(8, fair_share / 2));
+                            const bool over_share    = n_prot_layer[il] > fair_share;
+
+                            int32_t s_best = -1;
+                            int32_t max_victim_count = -1;
+
+                            int32_t cur = head_prot;
+                            for (int32_t hops = 0; hops < 32 && cur >= 0; ++hops) {
+                                if (key_of[cur] < 0) {
+                                    s_best = cur;
+                                    break;
+                                }
+                                const int32_t vl = key_of[cur] / n_expert;
+                                const int32_t ve = key_of[cur] % n_expert;
+                                if (vl == il && seen[ve] == seen_gen) {
+                                    cur = next[cur];
+                                    continue;
+                                }
+                                if (over_share && vl == il) {
+                                    s_best = cur;
+                                    break;
+                                }
+                                if (!over_share && n_prot_layer[vl] > fair_share) {
+                                    s_best = cur;
+                                    break;
+                                }
+                                if (n_prot_layer[vl] > floor_min && n_prot_layer[vl] > max_victim_count) {
+                                    max_victim_count = n_prot_layer[vl];
+                                    s_best = cur;
+                                }
+                                cur = next[cur];
+                            }
+
+                            if (s_best >= 0) {
+                                s_prot = s_best;
+                            }
+                        } else if (key_of[s_prot] >= 0) {
+                            int32_t cur = head_prot;
+                            for (int32_t hops = 0; hops < 32 && cur >= 0; ++hops) {
+                                if (key_of[cur] < 0) {
+                                    s_prot = cur;
+                                    break;
+                                }
+                                const int32_t vl = key_of[cur] / n_expert;
+                                const int32_t ve = key_of[cur] % n_expert;
+                                if (vl == il && seen[ve] == seen_gen) {
+                                    cur = next[cur];
+                                    continue;
+                                }
+                                s_prot = cur;
+                                break;
+                            }
+                        }
+
+                        if (key_of[s_prot] >= 0) {
+                            const int32_t vl = key_of[s_prot] / n_expert;
+                            const int32_t ve = key_of[s_prot] % n_expert;
+                            if (vl == il && seen[ve] == seen_gen) {
+                                // all accessible victims are active batch experts; keep in ephemeral
+                                if (s != tail_prob && head_prob >= 0) {
+                                    remove_node(s, head_prob, tail_prob);
+                                    push_tail_node(s, head_prob, tail_prob);
+                                }
+                                continue;
+                            }
+                        }
+
                         remove_node(s_prot, head_prot, tail_prot);
                         push_tail_node(s_prot, head_prot, tail_prot);
                         if (key_of[s_prot] >= 0) {
-                            slot_map[key_of[s_prot] / n_expert][key_of[s_prot] % n_expert] = -1;
+                            const int32_t victim_layer = key_of[s_prot] / n_expert;
+                            slot_map[victim_layer][key_of[s_prot] % n_expert] = -1;
+                            n_prot_layer[victim_layer]--;
                         } else {
                             n_prot++;
                         }
+                        n_prot_layer[il]++;
                         key_of[s_prot] = il*n_expert + e;
                         slots[e] = s_prot;
 
@@ -271,6 +365,7 @@ struct moe_cache_lru {
                         push_tail_node(s, head_prot, tail_prot);
                         is_protected[s] = true;
                         n_prot++;
+                        n_prot_layer[il]++;
                     }
                 } else if (n_persist == 0) {
                     if (s != tail_prob && head_prob >= 0) {
@@ -291,28 +386,16 @@ struct moe_cache_lru {
                 continue;
             }
 
-            int32_t s = -1;
-            if (eff_ephem > 0) {
-                s = head_prob;
-                if (s >= 0) {
-                    remove_node(s, head_prob, tail_prob);
-                } else if (head_prot >= 0) {
-                    s = head_prot;
-                    remove_node(s, head_prot, tail_prot);
-                    is_protected[s] = false;
-                    if (key_of[s] >= 0) {
-                        n_prot--;
-                    }
-                }
-            } else {
-                s = head_prob;
-                if (s >= 0) {
-                    remove_node(s, head_prob, tail_prob);
-                } else if (head_prot >= 0) {
-                    s = head_prot;
-                    remove_node(s, head_prot, tail_prot);
-                    is_protected[s] = false;
+            int32_t s = head_prob;
+            if (s >= 0) {
+                remove_node(s, head_prob, tail_prob);
+            } else if (head_prot >= 0) {
+                s = head_prot;
+                remove_node(s, head_prot, tail_prot);
+                is_protected[s] = false;
+                if (key_of[s] >= 0) {
                     n_prot--;
+                    n_prot_layer[key_of[s] / n_expert]--;
                 }
             }
 

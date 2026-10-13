@@ -2096,7 +2096,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
     // the ephemeral MoE cache tier lives in the prefill headroom: a batch larger than the sized
     // decode region overwrites it, so disable the tier for that decode (the slot maps are cleared
-    // by the invalidation and the next smaller decode re-enables the tier)
+    // by the invalidation; prior decode/prefill pass synchronization ensures slot maps are quiesced)
     if (n_tokens_all > (uint32_t) llama_moe_cache::max_batch) {
         set_moe_cache_ephem_enabled(false);
     } else {
