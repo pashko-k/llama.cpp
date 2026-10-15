@@ -1163,6 +1163,8 @@ size_t ggml_gallocr_get_tail_padding_offset(ggml_gallocr_t galloc, int buffer_id
     if (n_chunks == 0) {
         return 0;
     }
+    // tail padding offset is only supported for single-chunk buffers
+    GGML_ASSERT(n_chunks == 1);
 
     // max_size is already alignment-multiple because tallocr aligns each allocation
     size_t offset = galloc->buf_tallocs[buffer_id]->chunks[n_chunks - 1]->max_size;
@@ -1182,6 +1184,10 @@ ggml_backend_buffer_t ggml_gallocr_get_buffer(ggml_gallocr_t galloc, int buffer_
     }
 
     int n_chunks = galloc->buf_tallocs[buffer_id]->n_chunks;
+    if (n_chunks > 1) {
+        // tail padding buffer is only supported for single-chunk buffers
+        GGML_ASSERT(n_chunks == 1);
+    }
     int chunk_idx = n_chunks > 0 ? n_chunks - 1 : 0;
     return galloc->buffers[buffer_id]->chunks[chunk_idx];
 }

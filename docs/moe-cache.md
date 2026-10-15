@@ -20,7 +20,7 @@ The MoE Cache keeps frequently accessed expert weights in GPU VRAM while storing
    - **Probationary Tier**: Newly accessed experts enter the probationary queue.
    - **Protected Tier**: Experts that receive repeat hits (frequency $\ge 2$) are promoted to the protected tier.
    - **Asynchronous Promotion**: In hybrid mode (ephemeral + persistent), promotions execute via asynchronous device-to-device (D2D) copies into persistent VRAM.
-   - **Periodic Frequency Decay**: Demotes the oldest protected entries back to probationary every 512 operations to adapt to context changes.
+   - **Periodic Frequency Decay**: Demotes the oldest 25% of protected entries back to probationary every 512 copy operations per device group (preventing cold experts from squatting in persistent VRAM across topic shifts).
 
 4. **Localized Pinned Memory**:
    - Registers host expert weight buffers with `cudaHostRegister` for line-rate PCIe DMA transfers without CPU bounce-buffering.
@@ -44,14 +44,6 @@ The MoE Cache keeps frequently accessed expert weights in GPU VRAM while storing
 | `-ncmoe N`, `--n-cpu-moe N` | `0` | Keep MoE weights of the first N layers in CPU memory. |
 | `-sm layer`, `--split-mode layer` | `layer` | Layer-split mode across multiple GPUs. Note: tensor-parallel modes (`-sm row` / `-sm tensor`) are not supported with MoE cache. |
 | `-ts`, `--tensor-split` | Proportional | Proportional VRAM fraction across GPUs (e.g. `-ts 12,8`). |
-
----
-
-## Environment Variables
-
-| Variable | Default | Description |
-|---|---|---|
-| `LLAMA_MOE_CACHE_LAYER_BUDGET` | `1` | Enable layer-adaptive persistent budgeting (1 = enabled, 0 = disabled). Prevents high-entropy layers from evicting repeat-hit experts of middle layers. |
 
 ---
 
