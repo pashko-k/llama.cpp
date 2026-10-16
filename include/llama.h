@@ -397,6 +397,7 @@ extern "C" {
         enum ggml_type type_v; // data type for V cache [EXPERIMENTAL]
 
         size_t moe_cache_size; // device cache in bytes for the experts kept in host memory, split among the devices like the layers, 0 = disabled [EXPERIMENTAL]
+        const size_t * moe_cache_sizes; // per-device cache sizes in bytes, indexed by the model device, size: llama_max_devices(), NULL = split moe_cache_size among the devices [EXPERIMENTAL]
 
         // Abort callback
         // if it returns true, execution of llama_decode() will be aborted
@@ -415,6 +416,7 @@ extern "C" {
         bool kv_unified;  // use a unified buffer across the input sequences when computing the attention
                           // try to disable when n_seq_max > 1 for improved performance when the sequences do not share a large prefix
                           // ref: https://github.com/ggml-org/llama.cpp/pull/14363
+        bool moe_cache_reuse_prefill; // reuse prefill compute buffer tail for ephemeral MoE cache [EXPERIMENTAL]
 
         // [EXPERIMENTAL]
         // backend sampler chain configuration (make sure the caller keeps the sampler chains alive)
@@ -1697,9 +1699,19 @@ extern "C" {
         int32_t n_sample;   // number of sampled tokens
     };
 
-    LLAMA_API struct llama_perf_context_data llama_perf_context      (const struct llama_context * ctx);
-    LLAMA_API void                           llama_perf_context_print(const struct llama_context * ctx);
-    LLAMA_API void                           llama_perf_context_reset(      struct llama_context * ctx);
+    struct llama_perf_moe_cache_data {
+        size_t hits;
+        size_t misses;
+        size_t bytes;
+        int64_t time_us;
+        int32_t n_slots;
+    };
+
+    LLAMA_API struct llama_perf_context_data   llama_perf_context        (const struct llama_context * ctx);
+    LLAMA_API void                             llama_perf_context_print  (const struct llama_context * ctx);
+    LLAMA_API void                             llama_perf_context_reset  (      struct llama_context * ctx);
+    LLAMA_API struct llama_perf_moe_cache_data llama_perf_moe_cache      (const struct llama_context * ctx);
+    LLAMA_API void                             llama_perf_moe_cache_print(const struct llama_context * ctx);
 
     // NOTE: the following work only with samplers constructed via llama_sampler_chain_init
     LLAMA_API struct llama_perf_sampler_data llama_perf_sampler      (const struct llama_sampler * chain);

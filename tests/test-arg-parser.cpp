@@ -288,6 +288,22 @@ static void test(void) {
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
     assert(params.load_mode == LLAMA_LOAD_MODE_NONE);
 
+    {
+        common_params moe_params;
+        argv = {"binary_name", "-m", "model.gguf", "--moe-cache-mib", "1024"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), moe_params, LLAMA_EXAMPLE_COMMON));
+        assert(moe_params.moe_cache_size == 1024ULL * 1024 * 1024);
+        assert(moe_params.moe_cache_sizes.empty());
+
+        argv = {"binary_name", "-m", "model.gguf", "--moe-cache-mib", "2048,512"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), moe_params, LLAMA_EXAMPLE_COMMON));
+        assert(moe_params.moe_cache_size == 0);
+        assert(moe_params.moe_cache_sizes.size() == llama_max_devices());
+        assert(moe_params.moe_cache_sizes[0] == 2048ULL * 1024 * 1024);
+        assert(moe_params.moe_cache_sizes[1] == 512ULL * 1024 * 1024);
+        assert(moe_params.moe_cache_sizes[2] == 0);
+    }
+
     argv = {"binary_name", "-lm", "mmap"};
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
     assert(params.load_mode == LLAMA_LOAD_MODE_MMAP);

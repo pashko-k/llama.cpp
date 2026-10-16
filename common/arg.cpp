@@ -2778,15 +2778,47 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_N_CPU_MOE"));
     add_opt(common_arg(
-        {"--moe-cache-mib"}, "N",
-        "GPU cache size in MiB for the MoE experts kept in the CPU. with multiple GPUs, it is split among them like the layers (--tensor-split) (default: 0, disabled)",
-        [](common_params & params, int value) {
-            if (value < 0) {
-                throw std::invalid_argument("invalid value");
+        {"--moe-cache-mib"}, "N0,N1,...",
+        "GPU cache size in MiB for the MoE experts kept in the CPU; with multiple GPUs, a single value is split among them like the layers (--tensor-split), or give a per-device list (default: 0, disabled)",
+        [](common_params & params, const std::string & value) {
+            if (value.empty()) {
+                throw std::invalid_argument("empty value");
             }
-            params.moe_cache_size = (size_t) value*1024*1024;
+            const std::regex regex{ R"([,/]+)" };
+            std::sregex_token_iterator it{ value.begin(), value.end(), regex, -1 };
+            std::vector<std::string> split_arg{ it, {} };
+            if (split_arg.size() > llama_max_devices()) {
+                throw std::invalid_argument(
+                    string_format("got %zu input configs, but system only has %zu devices", split_arg.size(), llama_max_devices())
+                );
+            }
+            if (split_arg.size() <= 1) {
+                int64_t val = std::stoll(value);
+                if (val < 0) {
+                    throw std::invalid_argument("invalid value");
+                }
+                params.moe_cache_size = (size_t) val * 1024 * 1024;
+                params.moe_cache_sizes.clear();
+            } else {
+                params.moe_cache_sizes.resize(llama_max_devices(), 0);
+                for (size_t i = 0; i < split_arg.size(); ++i) {
+                    int64_t val = std::stoll(split_arg[i]);
+                    if (val < 0) {
+                        throw std::invalid_argument("invalid value");
+                    }
+                    params.moe_cache_sizes[i] = (size_t) val * 1024 * 1024;
+                }
+                params.moe_cache_size = 0;
+            }
         }
     ).set_env("LLAMA_ARG_MOE_CACHE_MIB"));
+    add_opt(common_arg(
+        {"--moe-cache-reuse-prefill"},
+        "reuse idle prefill compute buffer memory for ephemeral MoE cache (0 extra VRAM)",
+        [](common_params & params) {
+            params.moe_cache_reuse_prefill = true;
+        }
+    ).set_env("LLAMA_ARG_MOE_CACHE_REUSE_PREFILL"));
     add_opt(common_arg(
         {"-ncffn", "--n-cpu-ffn"}, "N",
         "keep the dense FFN weights of the first N layers in the CPU\n"
