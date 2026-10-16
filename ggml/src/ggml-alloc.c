@@ -421,14 +421,29 @@ static size_t ggml_vbuffer_size(struct vbuffer * buf) {
     return size;
 }
 
-static struct vbuffer * ggml_vbuffer_alloc(ggml_backend_buffer_type_t buft, const struct ggml_dyn_tallocr * talloc, enum ggml_backend_buffer_usage usage) {
+static struct vbuffer * ggml_vbuffer_alloc(ggml_backend_buffer_type_t buft, const struct ggml_dyn_tallocr * talloc, size_t tail_pad, enum ggml_backend_buffer_usage usage) {
     struct vbuffer * buf = (struct vbuffer *)calloc(1, sizeof(struct vbuffer));
     if (buf == NULL) {
         return NULL;
     }
 
+    if (talloc->n_chunks == 0) {
+        if (tail_pad > 0) {
+            buf->chunks[0] = ggml_backend_buft_alloc_buffer(buft, tail_pad);
+            if (buf->chunks[0] == NULL) {
+                ggml_vbuffer_free(buf);
+                return NULL;
+            }
+            ggml_backend_buffer_set_usage(buf->chunks[0], usage);
+        }
+        return buf;
+    }
+
     for (int n = 0; n < talloc->n_chunks; n++) {
         size_t chunk_size = talloc->chunks[n]->max_size;
+        if (n == talloc->n_chunks - 1) {
+            chunk_size += tail_pad;
+        }
         buf->chunks[n] = ggml_backend_buft_alloc_buffer(buft, chunk_size);
         if (buf->chunks[n] == NULL) {
             ggml_vbuffer_free(buf);
@@ -483,6 +498,7 @@ struct ggml_gallocr {
     ggml_backend_buffer_type_t * bufts; // [n_buffers]
     struct vbuffer ** buffers; // [n_buffers]
     struct ggml_dyn_tallocr ** buf_tallocs; // [n_buffers]
+    size_t * tail_pad_bytes; // [n_buffers]
     int n_buffers;
 
     struct ggml_hash_set hash_set;
@@ -507,6 +523,9 @@ ggml_gallocr_t ggml_gallocr_new_n(ggml_backend_buffer_type_t * bufts, int n_bufs
 
     galloc->buf_tallocs = calloc(n_bufs, sizeof(struct ggml_dyn_tallocr *));
     GGML_ASSERT(galloc->buf_tallocs != NULL);
+
+    galloc->tail_pad_bytes = calloc(n_bufs, sizeof(size_t));
+    GGML_ASSERT(galloc->tail_pad_bytes != NULL);
 
     for (int i = 0; i < n_bufs; i++) {
         galloc->bufts[i] = bufts[i];
@@ -574,6 +593,7 @@ void ggml_gallocr_free(ggml_gallocr_t galloc) {
     free(galloc->bufts);
     free(galloc->buffers);
     free(galloc->buf_tallocs);
+    free(galloc->tail_pad_bytes);
     free(galloc->node_allocs);
     free(galloc->leaf_allocs);
     free(galloc);
@@ -914,12 +934,25 @@ static bool ggml_gallocr_reserve_n_impl(
         // even if there are no tensors allocated in this buffer, we still need to allocate it to initialize views
         bool realloc = galloc->buffers[i] == NULL;
         size_t new_size = 0;
-        for (int c = 0; c < galloc->buf_tallocs[i]->n_chunks; c++) {
-            size_t cur_chunk_size = galloc->buffers[i] ? ggml_vbuffer_chunk_size(galloc->buffers[i], c) : 0;
-            size_t new_chunk_size = ggml_dyn_tallocr_max_size(galloc->buf_tallocs[i], c);
-            new_size += new_chunk_size;
-            if (new_chunk_size > cur_chunk_size) {
+        size_t tail_pad = galloc->tail_pad_bytes[i];
+        int n_chunks = galloc->buf_tallocs[i]->n_chunks;
+        if (n_chunks == 0 && tail_pad > 0) {
+            size_t cur_size = galloc->buffers[i] ? ggml_vbuffer_chunk_size(galloc->buffers[i], 0) : 0;
+            if (tail_pad > cur_size) {
                 realloc = true;
+            }
+            new_size = tail_pad;
+        } else {
+            for (int c = 0; c < n_chunks; c++) {
+                size_t cur_chunk_size = galloc->buffers[i] ? ggml_vbuffer_chunk_size(galloc->buffers[i], c) : 0;
+                size_t new_chunk_size = ggml_dyn_tallocr_max_size(galloc->buf_tallocs[i], c);
+                if (c == n_chunks - 1) {
+                    new_chunk_size += tail_pad;
+                }
+                new_size += new_chunk_size;
+                if (new_chunk_size > cur_chunk_size) {
+                    realloc = true;
+                }
             }
         }
         if (realloc) {
@@ -936,7 +969,7 @@ static bool ggml_gallocr_reserve_n_impl(
             if (no_alloc) {
                 galloc->buffers[i] = NULL;
             } else {
-                galloc->buffers[i] = ggml_vbuffer_alloc(galloc->bufts[i], galloc->buf_tallocs[i], GGML_BACKEND_BUFFER_USAGE_COMPUTE);
+                galloc->buffers[i] = ggml_vbuffer_alloc(galloc->bufts[i], galloc->buf_tallocs[i], tail_pad, GGML_BACKEND_BUFFER_USAGE_COMPUTE);
                 if (galloc->buffers[i] == NULL) {
                     GGML_LOG_ERROR("%s: failed to allocate %s buffer of size %zu\n", __func__, ggml_backend_buft_name(galloc->bufts[i]), new_size);
                     return false;
@@ -1113,6 +1146,50 @@ size_t ggml_gallocr_get_buffer_size(ggml_gallocr_t galloc, int buffer_id) {
     }
 
     return ggml_vbuffer_size(galloc->buffers[buffer_id]);
+}
+
+void ggml_gallocr_set_tail_padding(ggml_gallocr_t galloc, int buffer_id, size_t tail_pad_bytes) {
+    GGML_ASSERT(galloc != NULL);
+    GGML_ASSERT(buffer_id >= 0 && buffer_id < galloc->n_buffers);
+
+    galloc->tail_pad_bytes[buffer_id] = tail_pad_bytes;
+}
+
+size_t ggml_gallocr_get_tail_padding_offset(ggml_gallocr_t galloc, int buffer_id) {
+    GGML_ASSERT(galloc != NULL);
+    GGML_ASSERT(buffer_id >= 0 && buffer_id < galloc->n_buffers);
+
+    int n_chunks = galloc->buf_tallocs[buffer_id]->n_chunks;
+    if (n_chunks == 0) {
+        return 0;
+    }
+    // tail padding offset is only supported for single-chunk buffers
+    GGML_ASSERT(n_chunks == 1);
+
+    // max_size is already alignment-multiple because tallocr aligns each allocation
+    size_t offset = galloc->buf_tallocs[buffer_id]->chunks[n_chunks - 1]->max_size;
+    size_t align = galloc->buf_tallocs[buffer_id]->alignment;
+    if (align > 0) {
+        offset = (offset + align - 1) & ~(align - 1);
+    }
+    return offset;
+}
+
+ggml_backend_buffer_t ggml_gallocr_get_buffer(ggml_gallocr_t galloc, int buffer_id) {
+    GGML_ASSERT(galloc != NULL);
+    GGML_ASSERT(buffer_id >= 0 && buffer_id < galloc->n_buffers);
+
+    if (galloc->buffers[buffer_id] == NULL) {
+        return NULL;
+    }
+
+    int n_chunks = galloc->buf_tallocs[buffer_id]->n_chunks;
+    if (n_chunks > 1) {
+        // tail padding buffer is only supported for single-chunk buffers
+        GGML_ASSERT(n_chunks == 1);
+    }
+    int chunk_idx = n_chunks > 0 ? n_chunks - 1 : 0;
+    return galloc->buffers[buffer_id]->chunks[chunk_idx];
 }
 
 // utils
