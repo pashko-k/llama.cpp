@@ -442,6 +442,10 @@ static struct vbuffer * ggml_vbuffer_alloc(ggml_backend_buffer_type_t buft, cons
     for (int n = 0; n < talloc->n_chunks; n++) {
         size_t chunk_size = talloc->chunks[n]->max_size;
         if (n == talloc->n_chunks - 1) {
+            if (SIZE_MAX - chunk_size < tail_pad) {
+                ggml_vbuffer_free(buf);
+                return NULL;
+            }
             chunk_size += tail_pad;
         }
         buf->chunks[n] = ggml_backend_buft_alloc_buffer(buft, chunk_size);
@@ -947,6 +951,10 @@ static bool ggml_gallocr_reserve_n_impl(
                 size_t cur_chunk_size = galloc->buffers[i] ? ggml_vbuffer_chunk_size(galloc->buffers[i], c) : 0;
                 size_t new_chunk_size = ggml_dyn_tallocr_max_size(galloc->buf_tallocs[i], c);
                 if (c == n_chunks - 1) {
+                    if (SIZE_MAX - new_chunk_size < tail_pad) {
+                        GGML_LOG_ERROR("%s: buffer size overflow\n", __func__);
+                        return false;
+                    }
                     new_chunk_size += tail_pad;
                 }
                 new_size += new_chunk_size;
@@ -1166,13 +1174,16 @@ size_t ggml_gallocr_get_tail_padding_offset(ggml_gallocr_t galloc, int buffer_id
     // tail padding offset is only supported for single-chunk buffers
     GGML_ASSERT(n_chunks == 1);
 
-    // max_size is already alignment-multiple because tallocr aligns each allocation
-    size_t offset = galloc->buf_tallocs[buffer_id]->chunks[n_chunks - 1]->max_size;
     size_t align = galloc->buf_tallocs[buffer_id]->alignment;
-    if (align > 0) {
-        offset = (offset + align - 1) & ~(align - 1);
+    size_t offset = 0;
+    if (galloc->buffers[buffer_id] != NULL) {
+        size_t total_size = ggml_vbuffer_chunk_size(galloc->buffers[buffer_id], 0);
+        size_t tail_pad = galloc->tail_pad_bytes[buffer_id];
+        offset = total_size >= tail_pad ? total_size - tail_pad : 0;
+    } else {
+        offset = galloc->buf_tallocs[buffer_id]->chunks[n_chunks - 1]->max_size;
     }
-    return offset;
+    return aligned_offset(NULL, offset, align);
 }
 
 ggml_backend_buffer_t ggml_gallocr_get_buffer(ggml_gallocr_t galloc, int buffer_id) {

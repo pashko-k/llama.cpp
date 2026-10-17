@@ -626,8 +626,8 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
     }
     if (moe_cache_reuse_prefill) {
         ctx_params.moe_cache_reuse_prefill = true;
-        // keep synthetic pp footprint small and avoid GPU OOM in CI
-        ctx_params.n_ubatch = 2;
+        // PP headroom over decode (TG capped at max_batch=32) ensures cache is allocated
+        ctx_params.n_ubatch = 64;
     }
 
     tensor_data_params tensor_params = { seed, stdev };
@@ -1049,6 +1049,7 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
             if (type == GGML_BACKEND_DEVICE_TYPE_GPU || type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
                 dev_configs.emplace_back(std::vector<ggml_backend_dev_t>{devices_meta[0]}, "MoE cache", LLAMA_SPLIT_MODE_LAYER, true, 1536*1024);
                 dev_configs.emplace_back(std::vector<ggml_backend_dev_t>{devices_meta[0]}, "MoE reuse prefill", LLAMA_SPLIT_MODE_LAYER, true, 0, true);
+                dev_configs.emplace_back(std::vector<ggml_backend_dev_t>{devices_meta[0]}, "MoE hybrid", LLAMA_SPLIT_MODE_LAYER, true, 1536*1024, true);
                 max_device_label_length = std::max(max_device_label_length, dev_configs.back().label.length());
                 // each GPU caches the layers assigned to it
                 if (devices_meta.size() > 1) {

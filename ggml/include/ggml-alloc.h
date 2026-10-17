@@ -76,7 +76,7 @@ GGML_API size_t ggml_gallocr_get_buffer_size(ggml_gallocr_t galloc, int buffer_i
 // set tail padding to reserve at the end of a buffer during allocation
 GGML_API void                  ggml_gallocr_set_tail_padding(ggml_gallocr_t galloc, int buffer_id, size_t tail_pad_bytes);
 GGML_API size_t                ggml_gallocr_get_tail_padding_offset(ggml_gallocr_t galloc, int buffer_id);
-// get the backend buffer (for multi-chunk buffers, returns the last chunk where tail padding resides)
+// get the backend buffer chunk where tail padding resides
 GGML_API ggml_backend_buffer_t ggml_gallocr_get_buffer(ggml_gallocr_t galloc, int buffer_id);
 
 // Utils

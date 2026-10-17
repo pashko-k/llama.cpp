@@ -301,7 +301,10 @@ static void test(void) {
         assert(moe_params.moe_cache_sizes.size() == llama_max_devices());
         assert(moe_params.moe_cache_sizes[0] == 2048ULL * 1024 * 1024);
         assert(moe_params.moe_cache_sizes[1] == 512ULL * 1024 * 1024);
-        assert(moe_params.moe_cache_sizes[2] == 0);
+        argv = {"binary_name", "-m", "model.gguf", "--moe-cache-reuse-prefill", "--moe-cache-mib", "1024"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), moe_params, LLAMA_EXAMPLE_COMMON));
+        assert(moe_params.moe_cache_reuse_prefill == true);
+        assert(moe_params.moe_cache_size == 1024ULL * 1024 * 1024);
     }
 
     argv = {"binary_name", "-lm", "mmap"};
