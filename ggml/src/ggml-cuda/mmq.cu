@@ -159,7 +159,7 @@ void ggml_cuda_mul_mat_q(
     float       *  dst_d = (float       *)  dst->data;
 
     // If src0 is a temporary compute buffer, clear any potential padding.
-    // Cache views into compute buffers skip padding clear; kernels read only data region.
+    // Non-contiguous tensors (e.g. interleaved MoE cache banks) skip flat padding clear.
     if (ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE && !src0->view_src) {
         const size_t size_data  = ggml_nbytes(src0);
         const size_t size_alloc = ggml_backend_buffer_get_alloc_size(src0->buffer, src0);

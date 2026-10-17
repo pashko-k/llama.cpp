@@ -918,6 +918,7 @@ void llama_context::sched_reserve() {
         moe_cache_buf.assign(backend_ptrs.size(), nullptr);
         moe_cache_base.assign(backend_ptrs.size(), nullptr);
         moe_cache_size.assign(backend_ptrs.size(), 0);
+        moe_cache_tg_sizes = tg_sizes;
         for (size_t i = 0; i < backend_ptrs.size(); ++i) {
             const size_t alignment = ggml_backend_buft_get_alignment(backend_buft[i]);
             const size_t s_tg      = GGML_PAD(tg_sizes[i], alignment);
@@ -1526,17 +1527,7 @@ bool llama_context::moe_cache_rebind() {
     if (!moe_cache_rebind_needed()) {
         return false;
     }
-    const uint32_t n_seqs       = cparams.n_seq_max;
-    const uint32_t n_tokens     = std::min(cparams.n_ctx, cparams.n_ubatch);
-    const uint32_t n_tokens_tg  = std::min(n_tokens, std::max(n_seqs, (uint32_t) llama_moe_cache::max_batch));
-    const uint32_t n_outputs_tg = std::min(n_tokens_tg, cparams.n_outputs_max);
-
-    llama_memory_context_ptr mctx;
-    if (memory) {
-        mctx = memory->init_full();
-    }
-    std::vector<size_t> tg_sizes(backend_ptrs.size(), 0);
-    graph_reserve(n_tokens_tg, n_seqs, n_outputs_tg, mctx.get(), /*split_only=*/ true, tg_sizes.data());
+    GGML_ASSERT(!moe_cache_tg_sizes.empty());
 
     bool rebound = false;
     for (size_t i = 0; i < backend_ptrs.size(); ++i) {
@@ -1548,7 +1539,7 @@ bool llama_context::moe_cache_rebind() {
             continue;
         }
         const size_t alignment = ggml_backend_buft_get_alignment(backend_buft[i]);
-        const size_t s_tg      = GGML_PAD(tg_sizes[i], alignment);
+        const size_t s_tg      = GGML_PAD(moe_cache_tg_sizes[i], alignment);
         const size_t s_pp      = GGML_PAD(ggml_backend_sched_get_tail_padding_offset(sched.get(), backend_ptrs[i]), alignment);
         const size_t s_ephem   = s_pp > s_tg ? s_pp - s_tg : 0;
         LLAMA_LOG_WARN("%s: the %s compute buffer was reallocated (graph region %.2f MiB), rebinding the MoE cache, the cached experts are lost\n",

@@ -323,6 +323,7 @@ private:
     // the device base and size of the bound buffers: the buffer pointer alone is not a reliable identity
     std::vector<void *> moe_cache_base;
     std::vector<size_t> moe_cache_size;
+    std::vector<size_t> moe_cache_tg_sizes;
 
     // decode output (2-dimensional array: [n_outputs][n_vocab])
     buffer_view<float> logits = {nullptr, 0};

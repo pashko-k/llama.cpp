@@ -941,15 +941,20 @@ struct llama_moe_cache::impl {
                     // Case A: Hybrid mode
                     // Only primary group straddles S_pp and uses ephemeral headroom; secondary groups are pure persistent
                     if (&g == primary_g) {
-                        g.n_ephem = std::min(max_slots, (int32_t)(ephem_bytes / g.slot_stride));
-                        int32_t n_persist = std::max(0, (int32_t)(group_persist_bytes / g.slot_stride) - 1);
-                        if (g.n_ephem + n_persist > max_slots) {
-                            n_persist = max_slots - g.n_ephem;
-                        }
+                        int32_t n_persist = group_persist_bytes >= (size_t) g.slot_stride
+                            ? std::max(0, (int32_t)(group_persist_bytes / g.slot_stride) - 1)
+                            : 0;
+                        n_persist = std::min(max_slots, n_persist);
+                        const int32_t max_ephem = n_persist == 0
+                            ? std::max(0, (int32_t)(ephem_bytes / g.slot_stride) - 1)
+                            : (int32_t)(ephem_bytes / g.slot_stride);
+                        g.n_ephem = std::min(max_slots - n_persist, max_ephem);
                         g.n_slots = g.n_ephem + n_persist;
                     } else {
                         g.n_ephem = 0;
-                        int32_t n_persist = std::max(0, (int32_t)(group_persist_bytes / g.slot_stride) - 1);
+                        int32_t n_persist = group_persist_bytes >= (size_t) g.slot_stride
+                            ? std::max(0, (int32_t)(group_persist_bytes / g.slot_stride) - 1)
+                            : 0;
                         if (n_persist > max_slots) {
                             n_persist = max_slots;
                         }
@@ -958,7 +963,9 @@ struct llama_moe_cache::impl {
                 } else {
                     // Case B: Pure ephemeral mode
                     const size_t group_ephem_bytes = (size_t) ((double) ephem_bytes * g.host_bytes / d.host_bytes);
-                    g.n_ephem = std::max(0, (int32_t)(group_ephem_bytes / g.slot_stride) - 1);
+                    g.n_ephem = group_ephem_bytes >= (size_t) g.slot_stride
+                        ? std::max(0, (int32_t)(group_ephem_bytes / g.slot_stride) - 1)
+                        : 0;
                     if (g.n_ephem > max_slots) {
                         g.n_ephem = max_slots;
                     }
@@ -984,7 +991,7 @@ struct llama_moe_cache::impl {
             }
 
             g.lru.init(model.layers.size(), n_expert, g.n_slots, g.n_ephem, (int32_t) g.layers.size());
-            n_tensors      += g.ref.size() * (1 + g.layers.size());
+            n_tensors      += g.ref.size();
             n_tensors_host += g.layers.size();
         }
 
@@ -1089,10 +1096,8 @@ struct llama_moe_cache::impl {
                     void * bank_addr = (char *) ggml_backend_buffer_get_base(ext_buf) + group_base + g.bank_offsets[ip];
                     ggml_backend_tensor_alloc(ext_buf, bank, bank_addr);
 
-                    const size_t guard_bytes = (ip + 1 < g.banks.size())
-                        ? (g.bank_offsets[ip + 1] - g.bank_offsets[ip])
-                        : (g.slot_stride - g.bank_offsets[ip]);
-                    moe_cache_zero_tensor_bytes(bank, g.n_slots * bank->nb[2], guard_bytes);
+                    const size_t matrix_bytes = g.ref[ip]->nb[2];
+                    moe_cache_zero_tensor_bytes(bank, g.n_slots * bank->nb[2], matrix_bytes);
                 }
                 for (int32_t il : g.layers) {
                     layer & l = layers[il];
@@ -1107,9 +1112,16 @@ struct llama_moe_cache::impl {
                 // First allocate primary group straddling S_pp
                 if (primary_g != nullptr && primary_g->n_slots > 0) {
                     const int32_t n_persist = primary_g->n_slots - primary_g->n_ephem;
-                    const size_t group_base = s_pp - (size_t) primary_g->n_ephem * primary_g->slot_stride;
-                    alloc_group_banks(*primary_g, group_base);
-                    cur_persist += (size_t) (n_persist + 1) * primary_g->slot_stride;
+                    if (n_persist > 0) {
+                        const size_t group_base = s_pp - (size_t) primary_g->n_ephem * primary_g->slot_stride;
+                        GGML_ASSERT(group_base >= base_offset);
+                        alloc_group_banks(*primary_g, group_base);
+                        cur_persist += (size_t) (n_persist + 1) * primary_g->slot_stride;
+                    } else {
+                        const size_t group_base = s_pp - (size_t) (primary_g->n_ephem + 1) * primary_g->slot_stride;
+                        GGML_ASSERT(group_base >= base_offset);
+                        alloc_group_banks(*primary_g, group_base);
+                    }
                 }
                 // Then allocate secondary groups sequentially in persistent space
                 for (group & g : groups) {
@@ -1128,8 +1140,11 @@ struct llama_moe_cache::impl {
                     if (g.id != (int32_t) id || g.n_slots == 0) {
                         continue;
                     }
-                    const size_t group_base = s_pp - cur_ephem_used - (size_t) (g.n_ephem + 1) * g.slot_stride;
-                    cur_ephem_used += (size_t) (g.n_ephem + 1) * g.slot_stride;
+                    const size_t group_span = (size_t) (g.n_ephem + 1) * g.slot_stride;
+                    cur_ephem_used += group_span;
+                    GGML_ASSERT(cur_ephem_used <= ephem_bytes);
+                    const size_t group_base = s_pp - cur_ephem_used;
+                    GGML_ASSERT(group_base >= base_offset);
                     alloc_group_banks(g, group_base);
                 }
             }
@@ -1258,10 +1273,8 @@ struct llama_moe_cache::impl {
                 for (size_t ip = 0; ip < g.banks.size(); ++ip) {
                     ggml_tensor * bank = g.banks[ip];
                     if (bank && bank->data) {
-                        const size_t guard_bytes = (ip + 1 < g.banks.size())
-                            ? (g.bank_offsets[ip + 1] - g.bank_offsets[ip])
-                            : (g.slot_stride - g.bank_offsets[ip]);
-                        moe_cache_zero_tensor_bytes(bank, g.n_slots * bank->nb[2], guard_bytes);
+                        const size_t matrix_bytes = g.ref[ip]->nb[2];
+                        moe_cache_zero_tensor_bytes(bank, g.n_slots * bank->nb[2], matrix_bytes);
                     }
                 }
             }
@@ -1273,10 +1286,19 @@ struct llama_moe_cache::impl {
             return false;
         }
         if (reuse_prefill) {
-            // all groups share the same ephem_enabled state
-            if (groups[0].n_slots == groups[0].n_ephem) {
-                return groups[0].lru.ephem_enabled;
+            bool has_slots = false;
+            for (const auto & g : groups) {
+                if (g.n_slots > 0) {
+                    has_slots = true;
+                    if (g.n_slots > g.n_ephem) {
+                        return true;
+                    }
+                }
             }
+            if (!has_slots) {
+                return false;
+            }
+            return is_ephem_enabled();
         }
         return true;
     }
@@ -1286,16 +1308,11 @@ struct llama_moe_cache::impl {
     }
 
     int32_t max_ephem_tokens() const {
-        if (!is_enabled()) {
-            return max_batch;
-        }
         int32_t max_tok = max_batch;
         if (reuse_prefill) {
             for (const auto & g : groups) {
                 if (g.n_slots > 0 && n_expert_used > 0) {
                     max_tok = std::min(max_tok, g.n_slots / (int32_t) n_expert_used);
-                } else {
-                    return 0;
                 }
             }
         }
@@ -1418,7 +1435,7 @@ struct llama_moe_cache::impl {
             }
         }
 
-        // upload the missing experts, consecutive experts going to consecutive slots are uploaded together
+        // upload the missing experts individually to respect interleaved slot strides
         const int64_t t_upload_start = ggml_time_us();
         size_t bytes = 0;
         for (size_t ip = 0; ip < l.experts.size(); ++ip) {
