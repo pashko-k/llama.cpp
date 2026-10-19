@@ -2198,6 +2198,14 @@ size_t ggml_backend_sched_get_buffer_size(ggml_backend_sched_t sched, ggml_backe
     return ggml_gallocr_get_buffer_size(sched->galloc, backend_index);
 }
 
+bool ggml_backend_sched_supports_tail_padding(ggml_backend_sched_t sched, ggml_backend_t backend) {
+    GGML_ASSERT(sched);
+    int backend_index = ggml_backend_sched_backend_id(sched, backend);
+    GGML_ASSERT(backend_index >= 0 && backend_index < sched->n_backends);
+
+    return ggml_gallocr_supports_tail_padding(sched->galloc, backend_index);
+}
+
 void ggml_backend_sched_set_tail_padding(ggml_backend_sched_t sched, ggml_backend_t backend, size_t tail_pad_bytes) {
     GGML_ASSERT(sched);
     int backend_index = ggml_backend_sched_backend_id(sched, backend);

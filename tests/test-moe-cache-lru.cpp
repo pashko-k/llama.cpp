@@ -1,4 +1,6 @@
 #include "../src/llama-moe-cache-lru.h"
+#include "../src/llama-cparams.h"
+#include "../src/llama-graph.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -440,6 +442,162 @@ static void test_batch_expert_fallback_preservation() {
     printf("  Passed.\n");
 }
 
+static void test_set_ephem_enabled_toggle() {
+    printf("Running test_set_ephem_enabled_toggle...\n");
+    const int32_t n_layer = 2;
+    const int32_t n_expert = 16;
+    const int32_t n_ephem = 4;
+    const int32_t n_slots = 8; // 4 ephem, 4 persistent
+
+    moe_cache_lru lru;
+    lru.init(n_layer, n_expert, n_slots, n_ephem, n_layer);
+
+    std::vector<int32_t> map0(n_expert, -1);
+    std::vector<int32_t> map1(n_expert, -1);
+    lru.slot_map[0] = map0.data();
+    lru.slot_map[1] = map1.data();
+
+    std::vector<moe_cache_lru::fill> fills;
+    std::vector<moe_cache_lru::promotion> promotions;
+    size_t n_hit = 0;
+
+    int32_t b_init[] = { 0, 1 };
+    lru.plan(0, b_init, 2, fills, promotions, n_hit);
+    for (int32_t e : { 0, 1 }) {
+        int32_t hit[] = { e };
+        lru.plan(0, hit, 1, fills, promotions, n_hit);
+    }
+    int32_t b_eph[] = { 2, 3 };
+    lru.plan(0, b_eph, 2, fills, promotions, n_hit);
+
+    int32_t s0 = lru.slot_map[0][0];
+    int32_t s1 = lru.slot_map[0][1];
+    int32_t s2 = lru.slot_map[0][2];
+    int32_t s3 = lru.slot_map[0][3];
+    GGML_ASSERT(s0 >= n_ephem && s0 < n_slots);
+    GGML_ASSERT(s1 >= n_ephem && s1 < n_slots);
+    GGML_ASSERT(s2 >= 0 && s2 < n_ephem);
+    GGML_ASSERT(s3 >= 0 && s3 < n_ephem);
+
+    // Disable ephemeral tier: ephemeral slots must be invalidated
+    lru.set_ephem_enabled(false);
+    GGML_ASSERT(!lru.ephem_enabled);
+    GGML_ASSERT(lru.slot_map[0][2] == -1);
+    GGML_ASSERT(lru.slot_map[0][3] == -1);
+    for (int32_t s = 0; s < n_ephem; ++s) {
+        GGML_ASSERT(lru.key_of[s] == -1);
+    }
+    // Persistent slots remain valid
+    GGML_ASSERT(lru.slot_map[0][0] == s0);
+    GGML_ASSERT(lru.slot_map[0][1] == s1);
+    GGML_ASSERT(lru.key_of[s0] == 0 * n_expert + 0);
+    GGML_ASSERT(lru.key_of[s1] == 0 * n_expert + 1);
+
+    // Active slots are reduced to persistent-only (4), overflow batch must fail
+    int32_t b_overflow[] = { 4, 5, 6, 7, 8 };
+    bool ok = lru.plan(0, b_overflow, 5, fills, promotions, n_hit);
+    GGML_ASSERT(!ok);
+
+    // Re-enable ephemeral tier: planning restores full capacity
+    lru.set_ephem_enabled(true);
+    GGML_ASSERT(lru.ephem_enabled);
+    ok = lru.plan(0, b_overflow, 5, fills, promotions, n_hit);
+    GGML_ASSERT(ok);
+    validate_batch_slots(lru, 0, b_overflow, 5);
+    validate_lru_invariants(lru);
+
+    // Pure ephemeral test (n_persist == 0)
+    {
+        moe_cache_lru pure_ephem;
+        pure_ephem.init(1, 16, 4, 4, 1);
+        std::vector<int32_t> pure_map(16, -1);
+        pure_ephem.slot_map[0] = pure_map.data();
+
+        int32_t b[] = { 1, 2 };
+        ok = pure_ephem.plan(0, b, 2, fills, promotions, n_hit);
+        GGML_ASSERT(ok);
+        GGML_ASSERT(pure_ephem.slot_map[0][1] >= 0);
+        GGML_ASSERT(pure_ephem.slot_map[0][2] >= 0);
+
+        pure_ephem.set_ephem_enabled(false);
+        GGML_ASSERT(pure_ephem.slot_map[0][1] == -1);
+        GGML_ASSERT(pure_ephem.slot_map[0][2] == -1);
+        ok = pure_ephem.plan(0, b, 2, fills, promotions, n_hit);
+        GGML_ASSERT(!ok);
+
+        pure_ephem.set_ephem_enabled(true);
+        ok = pure_ephem.plan(0, b, 2, fills, promotions, n_hit);
+        GGML_ASSERT(ok);
+        validate_batch_slots(pure_ephem, 0, b, 2);
+        validate_lru_invariants(pure_ephem);
+    }
+
+    printf("  Passed.\n");
+}
+
+static void test_graph_params_allow_reuse() {
+    printf("Running test_graph_params_allow_reuse...\n");
+
+    llm_graph_params p1{};
+    llm_graph_params p2{};
+
+    GGML_ASSERT(p1.allow_reuse(p2));
+    GGML_ASSERT(p2.allow_reuse(p1));
+
+    // Ephemeral cache state mismatch rejects reuse
+    p2.moe_cache_ephem_enabled = true;
+    GGML_ASSERT(!p1.allow_reuse(p2));
+    GGML_ASSERT(!p2.allow_reuse(p1));
+
+    p1.moe_cache_ephem_enabled = true;
+    GGML_ASSERT(p1.allow_reuse(p2));
+    GGML_ASSERT(p2.allow_reuse(p1));
+
+    // Warmup state mismatch rejects reuse
+    p2.cparams.warmup = true;
+    GGML_ASSERT(!p1.allow_reuse(p2));
+    GGML_ASSERT(!p2.allow_reuse(p1));
+
+    p1.cparams.warmup = true;
+    GGML_ASSERT(p1.allow_reuse(p2));
+    GGML_ASSERT(p2.allow_reuse(p1));
+
+    printf("  Passed.\n");
+}
+
+static void test_lru_zero_slots() {
+    printf("Running test_lru_zero_slots...\n");
+    const int32_t n_layer = 2;
+    const int32_t n_expert = 16;
+    const int32_t n_ephem = 4;
+    const int32_t n_slots = 8;
+
+    moe_cache_lru lru;
+    lru.init(n_layer, n_expert, n_slots, n_ephem, n_layer);
+    std::vector<int32_t> map0(n_expert, -1);
+    lru.slot_map[0] = map0.data();
+
+    std::vector<moe_cache_lru::fill> fills;
+    std::vector<moe_cache_lru::promotion> promotions;
+    size_t n_hit = 0;
+
+    int32_t b[] = { 1, 2 };
+    bool ok = lru.plan(0, b, 2, fills, promotions, n_hit);
+    GGML_ASSERT(ok);
+
+    // Reset to zero slots: verify null slot_map entries and that plan returns false without dereference
+    lru.init(n_layer, n_expert, 0, 0, n_layer);
+    GGML_ASSERT(lru.n_slots == 0);
+    GGML_ASSERT(lru.n_ephem == 0);
+    GGML_ASSERT(lru.slot_map[0] == nullptr);
+
+    ok = lru.plan(0, b, 2, fills, promotions, n_hit);
+    GGML_ASSERT(!ok);
+    validate_lru_invariants(lru);
+
+    printf("  Passed.\n");
+}
+
 int main() {
     test_b1_overflow_and_invalidation();
     test_b2_slru_accounting_and_decay();
@@ -447,6 +605,9 @@ int main() {
     test_multi_expert_batch_promotions();
     test_batch_expert_fallback_preservation();
     test_stress_cycles();
+    test_set_ephem_enabled_toggle();
+    test_graph_params_allow_reuse();
+    test_lru_zero_slots();
     printf("All moe_cache_lru tests passed successfully!\n");
     return 0;
 }

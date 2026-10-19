@@ -806,6 +806,7 @@ struct llm_graph_params {
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
     const llama_moe_cache        * moe_cache;
+    bool moe_cache_ephem_enabled = false;
 
     const llama_prec_policy * prec_policy = nullptr;
 
@@ -898,10 +899,12 @@ struct llm_graph_params {
         }
 
         return
+            cparams.warmup                  == other.cparams.warmup                  &&
             cparams.embeddings              == other.cparams.embeddings              &&
             cparams.embeddings_nextn        == other.cparams.embeddings_nextn        &&
             cparams.embeddings_nextn_masked == other.cparams.embeddings_nextn_masked &&
             cparams.causal_attn             == other.cparams.causal_attn             &&
+            moe_cache_ephem_enabled         == other.moe_cache_ephem_enabled         &&
             arch  == other.arch  &&
             gtype == other.gtype &&
             cvec  == other.cvec  &&

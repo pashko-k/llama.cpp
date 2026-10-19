@@ -107,7 +107,7 @@ void moe_cache_lru::init(int32_t n_layer, int32_t n_expert, int32_t n_slots, int
             prev[s] = s - 1;
             next[s] = s + 1 < n_slots ? s + 1 : -1;
         }
-        head_prob = 0;
+        head_prob = n_slots > 0 ? 0 : -1;
         tail_prob = n_slots - 1;
         head_prot = -1;
         tail_prot = -1;
@@ -583,6 +583,7 @@ struct llama_moe_cache::impl {
         size_t buf_host_size = 0;
 
         std::vector<void *> pinned_pages;
+        bool supported = true;
     };
 
     // layers of the same device with the same expert tensor layout share the banks and the LRU of a group
@@ -833,7 +834,10 @@ struct llama_moe_cache::impl {
 
     void unbind_device(size_t id) {
         device & d = devices[id];
-        d.compute_buf = nullptr;
+        d.compute_buf   = nullptr;
+        d.base_offset   = 0;
+        d.ephem_bytes   = 0;
+        d.persist_bytes = 0;
         for (group & g : groups) {
             if (g.id != (int32_t) id) {
                 continue;
@@ -845,6 +849,9 @@ struct llama_moe_cache::impl {
                 for (const ggml_tensor * t : layers[il].experts) {
                     bindings.erase(t);
                 }
+                layers[il].ig = -1;
+                layers[il].slot_map = nullptr;
+                layers[il].experts.clear();
             }
             g.banks.clear();
             g.bank_offsets.clear();
@@ -861,15 +868,57 @@ struct llama_moe_cache::impl {
         d.buf_host_size = 0;
     }
 
+    void disable_device(size_t id) {
+        devices[id].supported = false;
+        unbind_device(id);
+    }
+
+    bool is_device_supported(size_t id) const {
+        return devices[id].supported && devices[id].host_bytes > 0;
+    }
+
+    bool is_device_enabled(size_t id) const {
+        for (const auto & g : groups) {
+            if (g.id == (int32_t) id && g.n_slots > 0) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     void unbind() {
         for (size_t id = 0; id < devices.size(); ++id) {
             unbind_device(id);
         }
     }
 
+    void zero_bank_bytes(ggml_tensor * bank, size_t offset, size_t size) {
+        if (bank == nullptr || bank->data == nullptr || size == 0) {
+            return;
+        }
+        const size_t nbytes = ggml_nbytes(bank);
+        const size_t prefix = offset < nbytes ? std::min(size, nbytes - offset) : 0;
+        if (prefix > 0) {
+            moe_cache_zero_tensor_bytes(bank, offset, prefix);
+        }
+        if (offset + size > nbytes) {
+            const size_t tail_offset = std::max(offset, nbytes);
+            const size_t tail_size   = offset + size - tail_offset;
+            GGML_ASSERT(bank->buffer != nullptr);
+            ggml_reset(ctx_views.get());
+            ggml_tensor * tail = ggml_new_tensor_1d(ctx_views.get(), GGML_TYPE_I8, (int64_t) tail_size);
+            GGML_ASSERT(ggml_backend_tensor_alloc(bank->buffer, tail, (char *) bank->data + tail_offset) == GGML_STATUS_SUCCESS);
+            moe_cache_zero_tensor_bytes(tail, 0, tail_size);
+        }
+    }
+
     // (re)allocate the banks of the device, either in an owned buffer (ext_buf == nullptr)
     // or in a slice of the compute buffer starting at base_offset
     size_t allocate_device(size_t id, ggml_backend_buffer_t ext_buf, size_t base_offset, size_t ephem_bytes, size_t persist_bytes) {
+        // the old banks may still be in use by an in-flight graph
+        if (!model.hparams.no_alloc) {
+            ggml_backend_synchronize(devices[id].backend);
+        }
         unbind_device(id);
 
         device & d = devices[id];
@@ -1065,9 +1114,6 @@ struct llama_moe_cache::impl {
                     ggml_tensor * bank = g.banks[ip];
                     void * bank_addr = (char *) ggml_backend_buffer_get_base(d.buf.get()) + group_offset + g.bank_offsets[ip];
                     ggml_backend_tensor_alloc(d.buf.get(), bank, bank_addr);
-
-                    const size_t matrix_bytes = g.ref[ip]->nb[2];
-                    moe_cache_zero_tensor_bytes(bank, g.n_slots * bank->nb[2], matrix_bytes);
                 }
                 group_offset += (g.n_slots + 1) * g.slot_stride;
                 for (int32_t il : g.layers) {
@@ -1095,10 +1141,9 @@ struct llama_moe_cache::impl {
                     ggml_tensor * bank = g.banks[ip];
                     void * bank_addr = (char *) ggml_backend_buffer_get_base(ext_buf) + group_base + g.bank_offsets[ip];
                     ggml_backend_tensor_alloc(ext_buf, bank, bank_addr);
-
-                    const size_t matrix_bytes = g.ref[ip]->nb[2];
-                    moe_cache_zero_tensor_bytes(bank, g.n_slots * bank->nb[2], matrix_bytes);
                 }
+                // all banks share one contiguous group span; zero it once from bank 0
+                zero_bank_bytes(g.banks[0], 0, (size_t) (g.n_slots + 1) * g.slot_stride);
                 for (int32_t il : g.layers) {
                     layer & l = layers[il];
                     if (l.slot_map != nullptr) {
@@ -1187,7 +1232,7 @@ struct llama_moe_cache::impl {
         unbind();
         for (size_t id = 0; id < devices.size(); ++id) {
             device & d = devices[id];
-            if (d.host_bytes == 0) {
+            if (d.host_bytes == 0 || !d.supported) {
                 continue;
             }
             size_t n_tensors      = 0;
@@ -1244,7 +1289,7 @@ struct llama_moe_cache::impl {
 
     size_t cache_size(ggml_backend_t backend) const {
         const auto it = std::find_if(devices.begin(), devices.end(), [&](const device & d) { return d.backend == backend; });
-        if (it == devices.end() || it->host_bytes == 0) {
+        if (it == devices.end() || it->host_bytes == 0 || !it->supported) {
             return 0;
         }
         return it->budget;
@@ -1252,7 +1297,7 @@ struct llama_moe_cache::impl {
 
     bool bind_compute_buffer(ggml_backend_t backend, ggml_backend_buffer_t compute_buf, size_t base_offset, size_t ephem_bytes, size_t persist_bytes) {
         const auto it = std::find_if(devices.begin(), devices.end(), [&](const device & d) { return d.backend == backend; });
-        if (it == devices.end() || it->host_bytes == 0) {
+        if (it == devices.end() || it->host_bytes == 0 || !it->supported) {
             return false;
         }
         if (!model.hparams.no_alloc && compute_buf == nullptr) {
@@ -1261,21 +1306,31 @@ struct llama_moe_cache::impl {
         if (compute_buf != nullptr) {
             GGML_ASSERT(base_offset + ephem_bytes + persist_bytes <= ggml_backend_buffer_get_size(compute_buf));
         }
-        return allocate_device((size_t) (it - devices.begin()), compute_buf, base_offset, ephem_bytes, persist_bytes) > 0;
+        const size_t id = (size_t) (it - devices.begin());
+        const size_t allocated = allocate_device(id, compute_buf, base_offset, ephem_bytes, persist_bytes);
+        if (allocated == 0) {
+            unbind_device(id);
+            return false;
+        }
+        return true;
     }
 
     void set_ephem_enabled(bool enabled) {
         for (group & g : groups) {
             const bool was_enabled = g.lru.ephem_enabled;
             g.lru.set_ephem_enabled(enabled);
-            // Re-zero guard slot only when transitioning into decode in pure ephemeral mode
-            if (enabled && !was_enabled && devices[g.id].persist_bytes == 0) {
-                for (size_t ip = 0; ip < g.banks.size(); ++ip) {
-                    ggml_tensor * bank = g.banks[ip];
-                    if (bank && bank->data) {
-                        const size_t matrix_bytes = g.ref[ip]->nb[2];
-                        moe_cache_zero_tensor_bytes(bank, g.n_slots * bank->nb[2], matrix_bytes);
-                    }
+            // clear the ephemeral region once when entering decode; prefill activations may have
+            // overwritten both the expert bytes and the inter-bank gaps
+            if (enabled && !was_enabled && g.n_ephem > 0 && !g.banks.empty()) {
+                ggml_tensor * bank = g.banks[0];
+                if (bank && bank->data) {
+                    const size_t n_slots_zero = g.n_slots == g.n_ephem
+                        ? (size_t) (g.n_slots + 1)
+                        : (size_t) g.n_ephem;
+                    // prefill activations may still be in use by an in-flight graph
+                    ggml_backend_synchronize(devices[g.id].backend);
+                    zero_bank_bytes(bank, 0, n_slots_zero * g.slot_stride);
+                    ggml_backend_synchronize(devices[g.id].backend);
                 }
             }
         }
@@ -1518,6 +1573,42 @@ bool llama_moe_cache::bind_compute_buffer(ggml_backend_t backend, ggml_backend_b
 
 void llama_moe_cache::unbind() {
     pimpl->unbind();
+}
+
+void llama_moe_cache::unbind_device(ggml_backend_t backend) {
+    for (size_t id = 0; id < pimpl->devices.size(); ++id) {
+        if (pimpl->devices[id].backend == backend) {
+            pimpl->unbind_device(id);
+            break;
+        }
+    }
+}
+
+void llama_moe_cache::disable_device(ggml_backend_t backend) {
+    for (size_t id = 0; id < pimpl->devices.size(); ++id) {
+        if (pimpl->devices[id].backend == backend) {
+            pimpl->disable_device(id);
+            break;
+        }
+    }
+}
+
+bool llama_moe_cache::is_device_supported(ggml_backend_t backend) const {
+    for (size_t id = 0; id < pimpl->devices.size(); ++id) {
+        if (pimpl->devices[id].backend == backend) {
+            return pimpl->is_device_supported(id);
+        }
+    }
+    return false;
+}
+
+bool llama_moe_cache::is_device_enabled(ggml_backend_t backend) const {
+    for (size_t id = 0; id < pimpl->devices.size(); ++id) {
+        if (pimpl->devices[id].backend == backend) {
+            return pimpl->is_device_enabled(id);
+        }
+    }
+    return false;
 }
 
 void llama_moe_cache::set_ephem_enabled(bool enabled) {

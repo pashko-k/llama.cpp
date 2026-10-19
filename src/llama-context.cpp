@@ -821,6 +821,9 @@ void llama_context::sched_reserve() {
         // the persistent part of the cache is kept in the tail padding of the compute buffer
         auto set_tail_padding = [&]() {
             for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+                if (!moe_cache->is_device_supported(backend_ptrs[i])) {
+                    continue;
+                }
                 const size_t s_persist = moe_cache->cache_size(backend_ptrs[i]);
                 if (s_persist > 0) {
                     ggml_backend_sched_set_tail_padding(sched.get(), backend_ptrs[i], s_persist);
@@ -920,6 +923,18 @@ void llama_context::sched_reserve() {
         moe_cache_size.assign(backend_ptrs.size(), 0);
         moe_cache_tg_sizes = tg_sizes;
         for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+            if (!moe_cache->is_device_supported(backend_ptrs[i])) {
+                continue;
+            }
+            if (!ggml_backend_sched_supports_tail_padding(sched.get(), backend_ptrs[i])) {
+                LLAMA_LOG_WARN("%s: compute buffer on backend %s is multi-chunk, disabling the MoE cache\n",
+                    __func__, ggml_backend_name(backend_ptrs[i]));
+                if (moe_cache->cache_size(backend_ptrs[i]) > 0) {
+                    sched_need_reserve = true;
+                }
+                moe_cache->disable_device(backend_ptrs[i]);
+                continue;
+            }
             const size_t alignment = ggml_backend_buft_get_alignment(backend_buft[i]);
             const size_t s_tg      = GGML_PAD(tg_sizes[i], alignment);
             const size_t s_pp      = GGML_PAD(ggml_backend_sched_get_tail_padding_offset(sched.get(), backend_ptrs[i]), alignment);
@@ -931,6 +946,18 @@ void llama_context::sched_reserve() {
                     moe_cache_base[i] = ggml_backend_buffer_get_base(buf);
                     moe_cache_size[i] = ggml_backend_buffer_get_size(buf);
                 }
+            } else if (!model.hparams.no_alloc) {
+                LLAMA_LOG_WARN("%s: failed to bind MoE cache on backend %s, disabling the MoE cache\n",
+                    __func__, ggml_backend_name(backend_ptrs[i]));
+                if (moe_cache->cache_size(backend_ptrs[i]) > 0) {
+                    sched_need_reserve = true;
+                }
+                moe_cache->disable_device(backend_ptrs[i]);
+            }
+        }
+        for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+            if (!moe_cache->is_device_supported(backend_ptrs[i])) {
+                GGML_ASSERT(!moe_cache->is_device_enabled(backend_ptrs[i]));
             }
         }
         moe_cache->set_ephem_enabled(ephem_prev);
@@ -1487,15 +1514,18 @@ void llama_context::set_warmup(bool value) {
     }
 
     cparams.warmup = value;
+    gf_res_prev_active = nullptr;
 
     // warmups are usually with small batches, so no need to reserve
     //sched_need_reserve = true;
 }
 
 void llama_context::set_moe_cache_ephem_enabled(bool enabled) {
-    if (moe_cache) {
-        moe_cache->set_ephem_enabled(enabled);
+    if (!moe_cache || moe_cache->is_ephem_enabled() == enabled) {
+        return;
     }
+    moe_cache->set_ephem_enabled(enabled);
+    gf_res_prev_active = nullptr; // early fast-path invalidation on tier change
 }
 
 // compare base and size because allocator can reuse freed buffer struct address
@@ -1514,6 +1544,9 @@ bool llama_context::moe_cache_rebind_needed() const {
     for (size_t i = 0; i < backend_ptrs.size(); ++i) {
         if (moe_cache_buf[i] == nullptr) {
             continue;
+        }
+        if (!ggml_backend_sched_supports_tail_padding(sched.get(), backend_ptrs[i])) {
+            return true;
         }
         if (moe_cache_buf_changed(ggml_backend_sched_get_buffer(sched.get(), backend_ptrs[i]),
                 moe_cache_buf[i], moe_cache_base[i], moe_cache_size[i])) {
@@ -1534,6 +1567,19 @@ bool llama_context::moe_cache_rebind() {
         if (moe_cache_buf[i] == nullptr) {
             continue;
         }
+        if (!ggml_backend_sched_supports_tail_padding(sched.get(), backend_ptrs[i])) {
+            LLAMA_LOG_WARN("%s: the %s compute buffer became multi-chunk, disabling the MoE cache\n",
+                    __func__, ggml_backend_buft_name(backend_buft[i]));
+            if (moe_cache->cache_size(backend_ptrs[i]) > 0) {
+                sched_need_reserve = true;
+            }
+            moe_cache_buf[i]  = nullptr;
+            moe_cache_base[i] = nullptr;
+            moe_cache_size[i] = 0;
+            moe_cache->disable_device(backend_ptrs[i]);
+            rebound = true;
+            continue;
+        }
         const ggml_backend_buffer_t buf = ggml_backend_sched_get_buffer(sched.get(), backend_ptrs[i]);
         if (buf == nullptr || !moe_cache_buf_changed(buf, moe_cache_buf[i], moe_cache_base[i], moe_cache_size[i])) {
             continue;
@@ -1544,9 +1590,19 @@ bool llama_context::moe_cache_rebind() {
         const size_t s_ephem   = s_pp > s_tg ? s_pp - s_tg : 0;
         LLAMA_LOG_WARN("%s: the %s compute buffer was reallocated (graph region %.2f MiB), rebinding the MoE cache, the cached experts are lost\n",
                 __func__, ggml_backend_buft_name(backend_buft[i]), s_pp/1024.0/1024.0);
-        // the old banks are dropped even if the new budget cannot fit any slot, so always record the new buffer
-        // and rebuild the graph: a failed bind just leaves the backend without a cache
-        (void) moe_cache->bind_compute_buffer(backend_ptrs[i], buf, s_tg, s_ephem, moe_cache->cache_size(backend_ptrs[i]));
+        // the old banks are dropped even if the new budget cannot fit any slot, so record the new buffer
+        // and rebuild the graph: a failed bind disables the cache for that backend
+        if (!moe_cache->bind_compute_buffer(backend_ptrs[i], buf, s_tg, s_ephem, moe_cache->cache_size(backend_ptrs[i]))) {
+            if (moe_cache->cache_size(backend_ptrs[i]) > 0) {
+                sched_need_reserve = true;
+            }
+            moe_cache->disable_device(backend_ptrs[i]);
+            moe_cache_buf[i]  = nullptr;
+            moe_cache_base[i] = nullptr;
+            moe_cache_size[i] = 0;
+            rebound = true;
+            continue;
+        }
         moe_cache_buf[i]  = buf;
         moe_cache_base[i] = ggml_backend_buffer_get_base(buf);
         moe_cache_size[i] = ggml_backend_buffer_get_size(buf);
@@ -1680,7 +1736,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
     const int32_t max_ephem = (cparams.moe_cache_reuse_prefill && moe_cache) ?
         moe_cache->max_ephem_tokens() : (int32_t) llama_moe_cache::max_batch;
-    const bool ephem = (gtype != LLM_GRAPH_TYPE_ENCODER) && ((int32_t) ubatch.n_tokens <= max_ephem);
+    // call-level decision in decode() is authoritative for the entire batch
+    // prevents trailing ubatches from re-enabling ephemeral tier and clobbering prefill activations
+    const bool ephem = (gtype != LLM_GRAPH_TYPE_ENCODER) &&
+                       moe_cache && moe_cache->is_ephem_enabled() &&
+                       ((int32_t) ubatch.n_tokens <= max_ephem);
     set_moe_cache_ephem_enabled(ephem);
 
     auto * res = get_gf_res_prev();
@@ -2905,9 +2965,10 @@ llm_graph_params llama_context::graph_params(
         /*.cvec        =*/ cvec.get(),
         /*.loras       =*/ loras.get(),
         /*.mctx        =*/ mctx,
-        /*.cross       =*/ &cross,
-        /*.moe_cache   =*/ moe_cache.get(),
-        /*.prec_policy =*/ &model.prec_policy,
+        /*.cross                   =*/ &cross,
+        /*.moe_cache               =*/ moe_cache.get(),
+        /*.moe_cache_ephem_enabled =*/ moe_cache ? moe_cache->is_ephem_enabled() : false,
+        /*.prec_policy             =*/ &model.prec_policy,
         /*.hdmd        =*/ model.hdmd.rot.empty() ? nullptr : &model.hdmd,
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,

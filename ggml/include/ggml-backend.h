@@ -351,6 +351,7 @@ extern "C" {
 
     GGML_API ggml_backend_buffer_type_t ggml_backend_sched_get_buffer_type(ggml_backend_sched_t sched, ggml_backend_t backend);
     GGML_API size_t                     ggml_backend_sched_get_buffer_size(ggml_backend_sched_t sched, ggml_backend_t backend);
+    GGML_API bool                       ggml_backend_sched_supports_tail_padding(ggml_backend_sched_t sched, ggml_backend_t backend);
     GGML_API void                       ggml_backend_sched_set_tail_padding(ggml_backend_sched_t sched, ggml_backend_t backend, size_t tail_pad_bytes);
     GGML_API size_t                     ggml_backend_sched_get_tail_padding_offset(ggml_backend_sched_t sched, ggml_backend_t backend);
     GGML_API ggml_backend_buffer_t      ggml_backend_sched_get_buffer(ggml_backend_sched_t sched, ggml_backend_t backend);

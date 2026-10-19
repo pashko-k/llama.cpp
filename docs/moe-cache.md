@@ -9,7 +9,7 @@ The MoE Cache keeps frequently accessed expert weights in GPU VRAM while storing
 1. **Zero-VRAM Ephemeral Pre-fill Headroom Reuse (`--moe-cache-reuse-prefill`)**:
    - Token generation uses drastically less activation memory ($S_{\text{tg}}$) than prompt processing ($S_{\text{pp}}$).
    - During token generation, the idle memory region $[S_{\text{tg}}, S_{\text{pp}}]$ is reclaimed as an ephemeral probationary cache at **0 extra bytes of VRAM**.
-   - During prefill batches (`n_tokens > 32`), ephemeral slots are automatically invalidated so prefill activations execute without interference.
+   - When batch size exceeds ephemeral capacity (`n_tokens > max_ephem_tokens()`, where `max_ephem_tokens() = std::min(max_batch, min_groups(n_slots / n_expert_used_max()))` across groups with `n_slots > 0`), ephemeral slots are automatically invalidated so activations execute without interference. The decision is made per `decode()` call and is sticky across ubatches.
 
 2. **Dedicated Persistent Cache (`--moe-cache-mib`)**:
    - Allocates dedicated persistent cache slots for hot experts in GPU VRAM.
@@ -31,7 +31,7 @@ The MoE Cache keeps frequently accessed expert weights in GPU VRAM while storing
    - Thread-safe refcounted registry (`pinned_buffer_registry`) manages page-aligned bounds across devices and contexts.
 
 6. **Multi-GPU Layer-Split Mode (`LLAMA_SPLIT_MODE_LAYER`)**:
-   - Each GPU hosting CPU MoE layers instantiates an isolated `llama_moe_cache` instance.
+   - A single context-level `llama_moe_cache` instance manages per-device groups across all GPUs hosting CPU MoE layers.
    - Prefill headroom and dedicated cache budgets are sized and applied per GPU backend independently.
    - Asynchronous transfers run concurrently on each device's stream.
 
@@ -75,11 +75,13 @@ Combines zero-VRAM prefill activation headroom with dedicated persistent tail pa
 To make hybrid caching possible, expert projection matrices are arranged with an **interleaved slot layout**:
 - Each slot $s$ groups all projections (`gate`, `up`, `down`) adjacent in memory.
 - All banks share a uniform slot stride $S_{\text{slot}}$ aligned to the least common multiple (LCM) of the backend alignment and quantization block sizes.
-- Ephemeral slots live strictly in $[S_{\text{tg}}, S_{\text{pp}})$, while persistent slots and the guard slot live strictly in $[S_{\text{pp}}, S_{\text{total}})$.
-- During prefill (`n_tokens > 32`), ephemeral slots are invalidated while persistent slots survive intact. Hot experts promoted to the persistent tier remain cached across prefill passes.
+- Ephemeral slots live strictly in $[S_{\text{tg}}, S_{\text{pp}})$, while persistent slots live strictly in $[S_{\text{pp}}, S_{\text{total}})$. In pure-ephemeral groups (`persist_bytes == 0`) and hybrid primary groups with `n_persist == 0`, the guard slot also resides inside $[S_{\text{tg}}, S_{\text{pp}})$ at $S_{\text{pp}} - S_{\text{slot}}$.
+- During prefill (`n_tokens > max_ephem_tokens()`), ephemeral slots are invalidated while persistent slots remain cached across prefill passes (subject to ordinary LRU eviction under cache pressure).
+- The guard slot (slot `N_slots`) absorbs out-of-range reads and incurs no matmul compute work: MMVQ kernels dispatch only over selected expert channels, while MMQ kernels launch one empty z-block per layer that returns immediately when `expert_bounds` difference is zero.
+- Inter-bank padding and the guard tail are zeroed when banks are bound and again when entering decode, so quantized overreads never see stale activations.
 
 > [!NOTE]
-> Interleaved 3D banks with non-contiguous slot strides (`nb[2] > ne[1] * nb[1]`) are supported on CUDA, CPU, and Metal backends.
+> Interleaved 3D banks with non-contiguous slot strides (`nb[2] > ne[1] * nb[1]`) are supported on CUDA, CPU, and Metal backends. If a backend's compute buffer exceeds single-chunk limits (multi-chunk buffers), the MoE cache is safely disabled on that backend. If persistent tail padding was reserved on the initial prompt-processing pass, it is reclaimed on the next reserve.
 
 ### 2. Zero-VRAM Ephemeral Mode (`--moe-cache-reuse-prefill`)
 
@@ -97,7 +99,7 @@ To make hybrid caching possible, expert projection matrices are arranged with an
 +---------------------------+---------------------------------------------+---------+
 ```
 
-During token generation, the idle memory region `[S_tg, S_pp]` is temporarily reused as an ephemeral cache at zero additional VRAM cost. On prefill batches (`n_tokens > 32`), ephemeral slots are invalidated to allow compute activations to proceed.
+During token generation, the idle memory region `[S_tg, S_pp]` is temporarily reused as an ephemeral cache at zero additional VRAM cost. On prefill batches (`n_tokens > max_ephem_tokens()`), ephemeral slots are invalidated to allow compute activations to proceed.
 
 ### 3. Dedicated Persistent Mode (`--moe-cache-mib`)
 

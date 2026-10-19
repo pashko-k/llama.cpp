@@ -36,6 +36,11 @@ public:
 
     // unbind the cache bank tensors from the compute buffer
     void unbind();
+    void unbind_device(ggml_backend_t backend);
+    void disable_device(ggml_backend_t backend);
+
+    bool is_device_supported(ggml_backend_t backend) const;
+    bool is_device_enabled(ggml_backend_t backend) const;
 
     void set_ephem_enabled(bool enabled);
 

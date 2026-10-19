@@ -24,6 +24,7 @@ struct dummy_backend_context {
 
     bool custom_alloc_buffer_n_called   = false;
     bool custom_get_alloc_size_n_called = false;
+    bool enforce_max_size               = false;
 
     size_t allocated_total() const {
         size_t n = 0;
@@ -42,6 +43,9 @@ static const char * dummy_backend_buffer_type_get_name(ggml_backend_buffer_type_
 
 static ggml_backend_buffer_t dummy_backend_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
     dummy_backend_context * ctx    = (dummy_backend_context *) buft->context;
+    if (ctx->enforce_max_size && size > ctx->max_buffer_size) {
+        return nullptr;
+    }
     ggml_backend_buffer_t & buffer = ctx->buffers.emplace_back();
     buffer                         = ggml_backend_buffer_init(buft, ctx->buffer_interface, ctx, size);
     return buffer;
@@ -1116,6 +1120,8 @@ static void test_tail_padding() {
     bool ok = ggml_gallocr_reserve(galloc, graph);
     GGML_ASSERT(ok);
 
+    GGML_ASSERT(ggml_gallocr_supports_tail_padding(galloc, 0));
+
     size_t total_buf_size = ggml_gallocr_get_buffer_size(galloc, 0);
     size_t pad_offset     = ggml_gallocr_get_tail_padding_offset(galloc, 0);
 
@@ -1141,6 +1147,58 @@ static void test_tail_padding() {
             GGML_ASSERT(offset + ggml_nbytes(graph->leafs[i]) <= pad_offset);
         }
     }
+
+    ggml_gallocr_free(galloc);
+}
+
+static void test_tail_padding_multi_chunk() {
+    // max_size = 64 forces multiple chunks when graph needs more than 64 bytes
+    dummy_backend backend             = dummy_backend_init(64);
+    backend.context->enforce_max_size = true;
+    auto [ctx, graph, ctx_ptr]        = make_context();
+
+    ggml_tensor * a = make_input_with_size(ctx, 48);
+    ggml_tensor * b = make_input_with_size(ctx, 48);
+    ggml_tensor * c = ggml_add(ctx, a, b);
+    ggml_build_forward_expand(graph, c);
+    assign_names(ctx);
+
+    ggml_gallocr_t galloc = ggml_gallocr_new(&backend.buffer_type);
+    const size_t tail_pad = 32;
+    ggml_gallocr_set_tail_padding(galloc, 0, tail_pad);
+
+    bool ok = ggml_gallocr_reserve(galloc, graph);
+    GGML_ASSERT(ok);
+
+    // Multi-chunk buffer must report no tail padding support and must not abort
+    GGML_ASSERT(!ggml_gallocr_supports_tail_padding(galloc, 0));
+    GGML_ASSERT(ggml_gallocr_get_tail_padding_offset(galloc, 0) == 0);
+    GGML_ASSERT(ggml_gallocr_get_buffer(galloc, 0) == nullptr);
+
+    ggml_gallocr_free(galloc);
+}
+
+static void test_tail_padding_exceeds_max_size() {
+    // max_size = 64, graph fits in a single chunk (48 bytes), but tail_pad (32 bytes) pushes it over max_size
+    dummy_backend backend             = dummy_backend_init(64);
+    backend.context->enforce_max_size = true;
+    auto [ctx, graph, ctx_ptr]        = make_context();
+
+    ggml_tensor * a = make_input_with_size(ctx, 48);
+    ggml_build_forward_expand(graph, a);
+    assign_names(ctx);
+
+    ggml_gallocr_t galloc = ggml_gallocr_new(&backend.buffer_type);
+    const size_t tail_pad = 32;
+    ggml_gallocr_set_tail_padding(galloc, 0, tail_pad);
+
+    bool ok = ggml_gallocr_reserve(galloc, graph);
+    GGML_ASSERT(ok);
+
+    // Padding that exceeds max_size must be skipped, reporting no support and not aborting
+    GGML_ASSERT(!ggml_gallocr_supports_tail_padding(galloc, 0));
+    GGML_ASSERT(ggml_gallocr_get_tail_padding_offset(galloc, 0) == 0);
+    GGML_ASSERT(ggml_gallocr_get_buffer(galloc, 0) == nullptr);
 
     ggml_gallocr_free(galloc);
 }
@@ -1186,5 +1244,7 @@ int main() {
     run("test_buft_get_alloc_size_n_custom_override_ctx_size", test_buft_get_alloc_size_n_custom_override_ctx_size);
     run("test_buft_get_alloc_size_n_does_not_allocate", test_buft_get_alloc_size_n_does_not_allocate);
     run("test_tail_padding", test_tail_padding);
+    run("test_tail_padding_multi_chunk", test_tail_padding_multi_chunk);
+    run("test_tail_padding_exceeds_max_size", test_tail_padding_exceeds_max_size);
     return 0;
 }

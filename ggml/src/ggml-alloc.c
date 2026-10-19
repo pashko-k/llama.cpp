@@ -441,7 +441,7 @@ static struct vbuffer * ggml_vbuffer_alloc(ggml_backend_buffer_type_t buft, cons
 
     for (int n = 0; n < talloc->n_chunks; n++) {
         size_t chunk_size = talloc->chunks[n]->max_size;
-        if (n == talloc->n_chunks - 1) {
+        if (n == talloc->n_chunks - 1 && talloc->n_chunks <= 1) {
             if (SIZE_MAX - chunk_size < tail_pad) {
                 ggml_vbuffer_free(buf);
                 return NULL;
@@ -503,6 +503,7 @@ struct ggml_gallocr {
     struct vbuffer ** buffers; // [n_buffers]
     struct ggml_dyn_tallocr ** buf_tallocs; // [n_buffers]
     size_t * tail_pad_bytes; // [n_buffers]
+    size_t * tail_pad_applied; // [n_buffers]
     int n_buffers;
 
     struct ggml_hash_set hash_set;
@@ -530,6 +531,9 @@ ggml_gallocr_t ggml_gallocr_new_n(ggml_backend_buffer_type_t * bufts, int n_bufs
 
     galloc->tail_pad_bytes = calloc(n_bufs, sizeof(size_t));
     GGML_ASSERT(galloc->tail_pad_bytes != NULL);
+
+    galloc->tail_pad_applied = calloc(n_bufs, sizeof(size_t));
+    GGML_ASSERT(galloc->tail_pad_applied != NULL);
 
     for (int i = 0; i < n_bufs; i++) {
         galloc->bufts[i] = bufts[i];
@@ -598,6 +602,7 @@ void ggml_gallocr_free(ggml_gallocr_t galloc) {
     free(galloc->buffers);
     free(galloc->buf_tallocs);
     free(galloc->tail_pad_bytes);
+    free(galloc->tail_pad_applied);
     free(galloc->node_allocs);
     free(galloc->leaf_allocs);
     free(galloc);
@@ -938,8 +943,18 @@ static bool ggml_gallocr_reserve_n_impl(
         // even if there are no tensors allocated in this buffer, we still need to allocate it to initialize views
         bool realloc = galloc->buffers[i] == NULL;
         size_t new_size = 0;
-        size_t tail_pad = galloc->tail_pad_bytes[i];
+        size_t req_tail_pad = galloc->tail_pad_bytes[i];
+        size_t tail_pad = 0;
         int n_chunks = galloc->buf_tallocs[i]->n_chunks;
+        if (req_tail_pad > 0 && n_chunks <= 1) {
+            size_t max_size = ggml_backend_buft_get_max_size(galloc->bufts[i]);
+            size_t last_chunk_size = n_chunks == 1 ? ggml_dyn_tallocr_max_size(galloc->buf_tallocs[i], 0) : 0;
+            if (SIZE_MAX - last_chunk_size >= req_tail_pad && last_chunk_size + req_tail_pad <= max_size) {
+                tail_pad = req_tail_pad;
+            }
+        }
+        galloc->tail_pad_applied[i] = tail_pad;
+
         if (n_chunks == 0 && tail_pad > 0) {
             size_t cur_size = galloc->buffers[i] ? ggml_vbuffer_chunk_size(galloc->buffers[i], 0) : 0;
             if (tail_pad > cur_size) {
@@ -1161,24 +1176,41 @@ void ggml_gallocr_set_tail_padding(ggml_gallocr_t galloc, int buffer_id, size_t 
     GGML_ASSERT(buffer_id >= 0 && buffer_id < galloc->n_buffers);
 
     galloc->tail_pad_bytes[buffer_id] = tail_pad_bytes;
+    galloc->tail_pad_applied[buffer_id] = 0;
+}
+
+bool ggml_gallocr_supports_tail_padding(ggml_gallocr_t galloc, int buffer_id) {
+    GGML_ASSERT(galloc != NULL);
+    GGML_ASSERT(buffer_id >= 0 && buffer_id < galloc->n_buffers);
+
+    int n_chunks = galloc->buf_tallocs[buffer_id]->n_chunks;
+    if (n_chunks > 1) {
+        return false;
+    }
+    if (galloc->tail_pad_bytes[buffer_id] > 0 && galloc->tail_pad_applied[buffer_id] == 0) {
+        return false;
+    }
+    return true;
 }
 
 size_t ggml_gallocr_get_tail_padding_offset(ggml_gallocr_t galloc, int buffer_id) {
     GGML_ASSERT(galloc != NULL);
     GGML_ASSERT(buffer_id >= 0 && buffer_id < galloc->n_buffers);
 
+    if (!ggml_gallocr_supports_tail_padding(galloc, buffer_id)) {
+        return 0;
+    }
+
     int n_chunks = galloc->buf_tallocs[buffer_id]->n_chunks;
     if (n_chunks == 0) {
         return 0;
     }
-    // tail padding offset is only supported for single-chunk buffers
-    GGML_ASSERT(n_chunks == 1);
 
     size_t align = galloc->buf_tallocs[buffer_id]->alignment;
     size_t offset = 0;
     if (galloc->buffers[buffer_id] != NULL) {
         size_t total_size = ggml_vbuffer_chunk_size(galloc->buffers[buffer_id], 0);
-        size_t tail_pad = galloc->tail_pad_bytes[buffer_id];
+        size_t tail_pad = galloc->tail_pad_applied[buffer_id];
         offset = total_size >= tail_pad ? total_size - tail_pad : 0;
     } else {
         offset = galloc->buf_tallocs[buffer_id]->chunks[n_chunks - 1]->max_size;
@@ -1190,15 +1222,11 @@ ggml_backend_buffer_t ggml_gallocr_get_buffer(ggml_gallocr_t galloc, int buffer_
     GGML_ASSERT(galloc != NULL);
     GGML_ASSERT(buffer_id >= 0 && buffer_id < galloc->n_buffers);
 
-    if (galloc->buffers[buffer_id] == NULL) {
+    if (galloc->buffers[buffer_id] == NULL || !ggml_gallocr_supports_tail_padding(galloc, buffer_id)) {
         return NULL;
     }
 
     int n_chunks = galloc->buf_tallocs[buffer_id]->n_chunks;
-    if (n_chunks > 1) {
-        // tail padding buffer is only supported for single-chunk buffers
-        GGML_ASSERT(n_chunks == 1);
-    }
     int chunk_idx = n_chunks > 0 ? n_chunks - 1 : 0;
     return galloc->buffers[buffer_id]->chunks[chunk_idx];
 }
